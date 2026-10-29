@@ -606,7 +606,7 @@ app.post('/api/bookings/status', requireCustomer, async (req, res) => {
       customerUid: req.customer.uid,
       phone
     })
-      .select('service date time status createdAt')
+      .select('service date time status createdAt quotedAmountPaise paymentMethod paymentStatus')
       .sort({ createdAt: -1 })
       .limit(100)
       .lean();
@@ -618,7 +618,13 @@ app.post('/api/bookings/status', requireCustomer, async (req, res) => {
         date: booking.date,
         time: booking.time,
         status: booking.status,
-        createdAt: booking.createdAt
+        createdAt: booking.createdAt,
+        quotedAmountPaise: booking.quotedAmountPaise,
+        paymentMethod: booking.paymentMethod,
+        paymentStatus: booking.paymentStatus,
+        quotedAmountPaise: booking.quotedAmountPaise,
+        paymentMethod: booking.paymentMethod,
+        paymentStatus: booking.paymentStatus
       }))
     });
   } catch (error) {
