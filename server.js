@@ -62,6 +62,28 @@ const bookingSchema = new mongoose.Schema(
 
 const Booking = mongoose.model('Booking', bookingSchema);
 
+const customerAddressSchema = new mongoose.Schema({
+  label: { type: String, trim: true, default: 'Home', maxlength: 40 },
+  addressLine1: { type: String, required: true, trim: true, maxlength: 200 },
+  addressLine2: { type: String, trim: true, default: '', maxlength: 200 },
+  landmark: { type: String, trim: true, default: '', maxlength: 120 },
+  city: { type: String, required: true, trim: true, maxlength: 80 },
+  state: { type: String, required: true, trim: true, maxlength: 80 },
+  postalCode: { type: String, required: true, trim: true, match: /^[0-9]{6}$/ },
+  isDefault: { type: Boolean, default: false }
+});
+
+const customerSchema = new mongoose.Schema({
+  firebaseUid: { type: String, required: true, unique: true, index: true },
+  name: { type: String, default: '', trim: true, maxlength: 80 },
+  phone: { type: String, default: '', trim: true },
+  email: { type: String, default: '', trim: true, lowercase: true, maxlength: 254 },
+  addresses: { type: [customerAddressSchema], default: [] }
+}, { timestamps: true });
+
+const Customer = mongoose.model('Customer', customerSchema);
+
+
 let customerFirebaseAuth = null;
 
 try {
@@ -100,7 +122,8 @@ async function requireCustomer(req, res, next) {
     const decoded = await customerFirebaseAuth.verifyIdToken(match[1]);
     req.customer = {
       uid: decoded.uid,
-      phoneNumber: decoded.phone_number || null
+      phoneNumber: decoded.phone_number || null,
+      email: decoded.email || null
     };
     return next();
   } catch (_) {
@@ -114,6 +137,154 @@ function customerLocalPhone(phoneNumber) {
   const digits = String(phoneNumber || '').replace(/\D/g, '');
   return digits.length >= 10 ? digits.slice(-10) : '';
 }
+
+
+// Customer's own profile. Firebase UID comes only from the verified ID token.
+app.get('/api/customer/me', requireCustomer, async (req, res) => {
+  try {
+    const updates = { phone: req.customer.phoneNumber || '' };
+    if (req.customer.email) updates.email = req.customer.email;
+
+    const customer = await Customer.findOneAndUpdate(
+      { firebaseUid: req.customer.uid },
+      { $set: updates, $setOnInsert: { firebaseUid: req.customer.uid } },
+      { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
+    ).lean();
+
+    return res.json({ customer });
+  } catch (error) {
+    console.error('Customer profile read error:', error.message);
+    return res.status(500).json({ message: 'Unable to load your profile.' });
+  }
+});
+
+// Update permitted profile fields. The verified phone cannot be edited here.
+app.patch('/api/customer/me', requireCustomer, async (req, res) => {
+  try {
+    const updates = {};
+
+    if (req.body.name !== undefined) {
+      if (typeof req.body.name !== 'string' || req.body.name.trim().length > 80) {
+        return res.status(400).json({ message: 'Name must be 80 characters or fewer.' });
+      }
+      updates.name = req.body.name.trim();
+    }
+
+    if (req.body.email !== undefined) {
+      if (typeof req.body.email !== 'string' || req.body.email.length > 254) {
+        return res.status(400).json({ message: 'Enter a valid email address.' });
+      }
+      const email = req.body.email.trim().toLowerCase();
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ message: 'Enter a valid email address.' });
+      }
+      updates.email = email;
+    }
+
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({ message: 'Provide a name or email to update.' });
+    }
+
+    const customer = await Customer.findOneAndUpdate(
+      { firebaseUid: req.customer.uid },
+      {
+        $set: { ...updates, phone: req.customer.phoneNumber || '' },
+        $setOnInsert: { firebaseUid: req.customer.uid }
+      },
+      { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
+    ).lean();
+
+    return res.json({ message: 'Profile saved.', customer });
+  } catch (error) {
+    console.error('Customer profile update error:', error.message);
+    return res.status(500).json({ message: 'Unable to save your profile.' });
+  }
+});
+
+// Add a saved service address for the signed-in customer.
+app.post('/api/customer/addresses', requireCustomer, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const addressLine1 = typeof body.addressLine1 === 'string' ? body.addressLine1.trim() : '';
+    const city = typeof body.city === 'string' ? body.city.trim() : '';
+    const state = typeof body.state === 'string' ? body.state.trim() : '';
+    const postalCode = typeof body.postalCode === 'string' ? body.postalCode.trim() : '';
+
+    if (!addressLine1 || !city || !state || !/^[0-9]{6}$/.test(postalCode)) {
+      return res.status(400).json({
+        message: 'Address line, city, state, and a valid six-digit PIN code are required.'
+      });
+    }
+
+    const customer = await Customer.findOneAndUpdate(
+      { firebaseUid: req.customer.uid },
+      {
+        $set: { phone: req.customer.phoneNumber || '' },
+        $setOnInsert: { firebaseUid: req.customer.uid }
+      },
+      { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
+    );
+
+    const makeDefault = body.isDefault === true || customer.addresses.length === 0;
+    if (makeDefault) {
+      customer.addresses.forEach(address => { address.isDefault = false; });
+    }
+
+    customer.addresses.push({
+      label: typeof body.label === 'string' ? body.label.trim().slice(0, 40) || 'Home' : 'Home',
+      addressLine1,
+      addressLine2: typeof body.addressLine2 === 'string' ? body.addressLine2.trim().slice(0, 200) : '',
+      landmark: typeof body.landmark === 'string' ? body.landmark.trim().slice(0, 120) : '',
+      city,
+      state,
+      postalCode,
+      isDefault: makeDefault
+    });
+
+    await customer.save();
+    const savedAddress = customer.addresses[customer.addresses.length - 1];
+
+    return res.status(201).json({
+      message: 'Address saved.',
+      address: savedAddress
+    });
+  } catch (error) {
+    console.error('Customer address save error:', error.message);
+    return res.status(500).json({ message: 'Unable to save this address.' });
+  }
+});
+
+// Delete only an address belonging to the signed-in customer.
+app.delete('/api/customer/addresses/:addressId', requireCustomer, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.addressId)) {
+      return res.status(400).json({ message: 'Invalid address ID.' });
+    }
+
+    const customer = await Customer.findOne({ firebaseUid: req.customer.uid });
+    if (!customer) {
+      return res.status(404).json({ message: 'Customer profile not found.' });
+    }
+
+    const address = customer.addresses.id(req.params.addressId);
+    if (!address) {
+      return res.status(404).json({ message: 'Address not found.' });
+    }
+
+    const wasDefault = address.isDefault;
+    customer.addresses.pull({ _id: req.params.addressId });
+
+    if (customer.addresses.length && (wasDefault || !customer.addresses.some(a => a.isDefault))) {
+      customer.addresses.forEach((a, index) => { a.isDefault = index === 0; });
+    }
+
+    await customer.save();
+    return res.json({ message: 'Address deleted.', addresses: customer.addresses });
+  } catch (error) {
+    console.error('Customer address delete error:', error.message);
+    return res.status(500).json({ message: 'Unable to delete this address.' });
+  }
+});
 
 // Test route
 app.get('/', (req, res) => {
