@@ -4,6 +4,8 @@ const mongoose = require('mongoose');
 const dotenv = require('dotenv');
 const cors = require('cors');
 const crypto = require('crypto');
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
 
 dotenv.config();
 
@@ -48,6 +50,7 @@ const bookingSchema = new mongoose.Schema(
       default: '',
       trim: true,
     },
+    customerUid: { type: String, required: false, index: true },
     status: {
       type: String,
       enum: ['pending', 'accepted', 'completed', 'cancelled'],
@@ -59,6 +62,59 @@ const bookingSchema = new mongoose.Schema(
 
 const Booking = mongoose.model('Booking', bookingSchema);
 
+let customerFirebaseAuth = null;
+
+try {
+  const encoded = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+  if (encoded) {
+    const serviceAccount = JSON.parse(
+      Buffer.from(encoded, 'base64').toString('utf8')
+    );
+    if (!getApps().length) {
+      initializeApp({ credential: cert(serviceAccount) });
+    }
+    customerFirebaseAuth = getAuth();
+    console.log('Firebase customer authentication initialized.');
+  } else {
+    console.warn('Firebase customer authentication is not configured.');
+  }
+} catch (error) {
+  console.error('Firebase Admin initialization failed:', error.message);
+}
+
+async function requireCustomer(req, res, next) {
+  if (!customerFirebaseAuth) {
+    return res.status(503).json({
+      message: 'Customer authentication is temporarily unavailable.'
+    });
+  }
+
+  const match = (req.get('authorization') || '').match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return res.status(401).json({
+      message: 'Please sign in to continue.'
+    });
+  }
+
+  try {
+    const decoded = await customerFirebaseAuth.verifyIdToken(match[1]);
+    req.customer = {
+      uid: decoded.uid,
+      phoneNumber: decoded.phone_number || null
+    };
+    return next();
+  } catch (_) {
+    return res.status(401).json({
+      message: 'Your sign-in has expired. Please sign in again.'
+    });
+  }
+}
+
+function customerLocalPhone(phoneNumber) {
+  const digits = String(phoneNumber || '').replace(/\D/g, '');
+  return digits.length >= 10 ? digits.slice(-10) : '';
+}
+
 // Test route
 app.get('/', (req, res) => {
   res.json({
@@ -67,7 +123,7 @@ app.get('/', (req, res) => {
 });
 
 // Create a booking
-app.post('/api/bookings', async (req, res) => {
+app.post('/api/bookings', requireCustomer, async (req, res) => {
   try {
     const {
       customerName,
@@ -92,7 +148,15 @@ app.post('/api/bookings', async (req, res) => {
       });
     }
 
+    const accountPhone = customerLocalPhone(req.customer.phoneNumber);
+    if (!accountPhone || accountPhone !== String(phone)) {
+      return res.status(403).json({
+        message: 'Use the phone number verified in your HomeFix account.'
+      });
+    }
+
     const booking = await Booking.create({
+      customerUid: req.customer.uid,
       customerName,
       phone: String(phone),
       address,
@@ -120,7 +184,7 @@ app.post('/api/bookings', async (req, res) => {
 
 
 // Allow customers to check their booking using their booking ID and phone.
-app.post('/api/bookings/status', async (req, res) => {
+app.post('/api/bookings/status', requireCustomer, async (req, res) => {
   try {
     const bookingId = String(req.body.bookingId || '').trim();
     const phone = String(req.body.phone || '').trim();
@@ -132,12 +196,40 @@ app.post('/api/bookings/status', async (req, res) => {
       });
     }
 
-    const booking = await Booking.findOne({
+    const accountPhone = customerLocalPhone(req.customer.phoneNumber);
+    if (!accountPhone || accountPhone !== phone) {
+      return res.status(403).json({
+        message: 'Use the phone number verified in your HomeFix account.'
+      });
+    }
+
+    // Look up bookings owned by this signed-in customer.
+    let booking = await Booking.findOne({
       _id: bookingId,
-      phone: phone,
+      phone,
+      customerUid: req.customer.uid,
     })
       .select('service date time status createdAt')
       .lean();
+
+    // Safely associate an older, unlinked booking only when its phone
+    // matches this customer's verified Firebase phone number.
+    if (!booking) {
+      booking = await Booking.findOneAndUpdate(
+        {
+          _id: bookingId,
+          phone,
+          $or: [
+            { customerUid: { $exists: false } },
+            { customerUid: null },
+          ],
+        },
+        { $set: { customerUid: req.customer.uid } },
+        { new: true }
+      )
+        .select('service date time status createdAt')
+        .lean();
+    }
 
     if (!booking) {
       return res.status(404).json({
