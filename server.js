@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 const dotenv = require('dotenv');
 const cors = require('cors');
 const crypto = require('crypto');
+const Razorpay = require('razorpay');
 const { initializeApp, cert, getApps } = require('firebase-admin/app');
 const { getAuth } = require('firebase-admin/auth');
 
@@ -51,6 +52,20 @@ const bookingSchema = new mongoose.Schema(
       trim: true,
     },
     customerUid: { type: String, required: false, index: true },
+    quotedAmountPaise: { type: Number, min: 0, default: null },
+    paymentMethod: {
+      type: String,
+      enum: ['cash_on_service', 'razorpay'],
+      default: null,
+    },
+    paymentStatus: {
+      type: String,
+      enum: ['not_started', 'pending_collection', 'created', 'authorized', 'paid', 'failed'],
+      default: 'not_started',
+    },
+    razorpayOrderId: { type: String, default: null },
+    razorpayPaymentId: { type: String, default: null },
+    paymentUpdatedAt: { type: Date, default: null },
     status: {
       type: String,
       enum: ['pending', 'accepted', 'completed', 'cancelled'],
@@ -355,6 +370,208 @@ app.post('/api/bookings', requireCustomer, async (req, res) => {
 
 
 // Allow customers to check their booking using their booking ID and phone.
+
+// Select Cash on Service after Admin has set a quote.
+app.post('/api/bookings/:id/payment/cash', requireCustomer, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid booking ID.' });
+    }
+
+    const booking = await Booking.findOne({
+      _id: req.params.id,
+      customerUid: req.customer.uid,
+    });
+
+    if (!booking) {
+      return res.status(404).json({ message: 'Booking not found.' });
+    }
+    if (booking.status === 'cancelled') {
+      return res.status(409).json({ message: 'Cancelled bookings cannot be paid.' });
+    }
+    if (!Number.isSafeInteger(booking.quotedAmountPaise) ||
+        booking.quotedAmountPaise <= 0) {
+      return res.status(409).json({ message: 'Your service quote is not ready yet.' });
+    }
+    if (booking.paymentStatus === 'paid') {
+      return res.status(409).json({ message: 'This booking is already paid.' });
+    }
+
+    booking.paymentMethod = 'cash_on_service';
+    booking.paymentStatus = 'pending_collection';
+    booking.razorpayOrderId = null;
+    booking.razorpayPaymentId = null;
+    booking.paymentUpdatedAt = new Date();
+    await booking.save();
+
+    return res.json({
+      message: 'Cash on Service selected. Payment is due after service.',
+      paymentMethod: booking.paymentMethod,
+      paymentStatus: booking.paymentStatus,
+      quotedAmountPaise: booking.quotedAmountPaise,
+    });
+  } catch (error) {
+    console.error('Cash payment selection error:', error.message);
+    return res.status(500).json({ message: 'Unable to select Cash on Service.' });
+  }
+});
+
+// Create a Razorpay order using only the quote stored in MongoDB.
+// Never accept the payable amount from the client.
+app.post('/api/payments/razorpay/order', requireCustomer, async (req, res) => {
+  try {
+    const bookingId = String(req.body.bookingId || '').trim();
+    if (!mongoose.isValidObjectId(bookingId)) {
+      return res.status(400).json({ message: 'Invalid booking ID.' });
+    }
+
+    const keyId = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!keyId || !keySecret) {
+      return res.status(503).json({ message: 'Online payments are not configured.' });
+    }
+
+    const booking = await Booking.findOne({
+      _id: bookingId,
+      customerUid: req.customer.uid,
+    });
+
+    if (!booking) {
+      return res.status(404).json({ message: 'Booking not found.' });
+    }
+    if (booking.status === 'cancelled') {
+      return res.status(409).json({ message: 'Cancelled bookings cannot be paid.' });
+    }
+    if (!Number.isSafeInteger(booking.quotedAmountPaise) ||
+        booking.quotedAmountPaise <= 0) {
+      return res.status(409).json({ message: 'Your service quote is not ready yet.' });
+    }
+    if (booking.paymentStatus === 'paid') {
+      return res.status(409).json({ message: 'This booking is already paid.' });
+    }
+
+    const razorpay = new Razorpay({ key_id: keyId, key_secret: keySecret });
+    const order = await razorpay.orders.create({
+      amount: booking.quotedAmountPaise,
+      currency: 'INR',
+      receipt: `hf_${booking._id}_${crypto.randomBytes(4).toString('hex')}`,
+      notes: {
+        bookingId: String(booking._id),
+        customerUid: req.customer.uid,
+      },
+    });
+
+    booking.paymentMethod = 'razorpay';
+    booking.paymentStatus = 'created';
+    booking.razorpayOrderId = order.id;
+    booking.razorpayPaymentId = null;
+    booking.paymentUpdatedAt = new Date();
+    await booking.save();
+
+    return res.status(201).json({
+      keyId,
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      bookingId: String(booking._id),
+      customerName: booking.customerName,
+      phone: req.customer.phoneNumber || booking.phone,
+    });
+  } catch (error) {
+    console.error('Razorpay order creation error:', error.message);
+    return res.status(500).json({ message: 'Unable to start online payment.' });
+  }
+});
+
+// Verify checkout signature, then confirm payment status with Razorpay.
+// A client callback alone is never enough to mark a booking paid.
+app.post('/api/payments/razorpay/verify', requireCustomer, async (req, res) => {
+  try {
+    const bookingId = String(req.body.bookingId || '').trim();
+    const orderId = String(req.body.razorpay_order_id || '').trim();
+    const paymentId = String(req.body.razorpay_payment_id || '').trim();
+    const signature = String(req.body.razorpay_signature || '').trim();
+
+    if (!mongoose.isValidObjectId(bookingId) ||
+        !orderId || !paymentId || !/^[a-f0-9]{64}$/i.test(signature)) {
+      return res.status(400).json({ message: 'Invalid payment verification details.' });
+    }
+
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!process.env.RAZORPAY_KEY_ID || !keySecret) {
+      return res.status(503).json({ message: 'Online payments are not configured.' });
+    }
+
+    const booking = await Booking.findOne({
+      _id: bookingId,
+      customerUid: req.customer.uid,
+      paymentMethod: 'razorpay',
+      razorpayOrderId: orderId,
+    });
+
+    if (!booking) {
+      return res.status(404).json({ message: 'Payment order not found for this booking.' });
+    }
+    if (booking.paymentStatus === 'paid' &&
+        booking.razorpayPaymentId === paymentId) {
+      return res.json({ message: 'Payment already verified.', paymentStatus: 'paid' });
+    }
+
+    const expected = crypto
+      .createHmac('sha256', keySecret)
+      .update(`${orderId}|${paymentId}`)
+      .digest();
+    const received = Buffer.from(signature, 'hex');
+
+    if (expected.length !== received.length ||
+        !crypto.timingSafeEqual(expected, received)) {
+      return res.status(400).json({ message: 'Payment signature verification failed.' });
+    }
+
+    const razorpay = new Razorpay({
+      key_id: process.env.RAZORPAY_KEY_ID,
+      key_secret: keySecret,
+    });
+    const payment = await razorpay.payments.fetch(paymentId);
+
+    if (payment.order_id !== orderId ||
+        payment.amount !== booking.quotedAmountPaise ||
+        payment.currency !== 'INR') {
+      return res.status(400).json({ message: 'Payment does not match the booking quote.' });
+    }
+
+    if (payment.status !== 'captured') {
+      booking.paymentStatus =
+        payment.status === 'authorized' ? 'authorized' : 'failed';
+      booking.razorpayPaymentId = paymentId;
+      booking.paymentUpdatedAt = new Date();
+      await booking.save();
+
+      return res.status(409).json({
+        message: payment.status === 'authorized'
+          ? 'Payment is authorized but not captured yet. The booking is not marked paid.'
+          : 'Payment has not been captured.',
+        paymentStatus: booking.paymentStatus,
+      });
+    }
+
+    booking.paymentStatus = 'paid';
+    booking.razorpayPaymentId = paymentId;
+    booking.paymentUpdatedAt = new Date();
+    await booking.save();
+
+    return res.json({
+      message: 'Payment verified successfully.',
+      paymentStatus: booking.paymentStatus,
+      paymentId,
+    });
+  } catch (error) {
+    console.error('Razorpay verification error:', error.message);
+    return res.status(500).json({ message: 'Unable to verify the payment right now.' });
+  }
+});
+
+
 app.post('/api/bookings/status', requireCustomer, async (req, res) => {
   try {
     const phone = String(req.body.phone || '').trim();
@@ -488,6 +705,89 @@ function requireAdminKey(req, res, next) {
 
   return res.status(401).json({ message: 'Unauthorized.' });
 }
+
+
+// Admin sets the service quote in rupees; backend stores the exact paise amount.
+app.patch('/api/admin/bookings/:id/quote', requireAdminKey, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid booking ID.' });
+    }
+
+    const amount = req.body.amountRupees;
+    if (typeof amount !== 'number' || !Number.isFinite(amount) ||
+        amount < 1 || amount > 100000 ||
+        Math.round(amount * 100) !== amount * 100) {
+      return res.status(400).json({
+        message: 'Enter a quote between ₹1 and ₹100,000 with at most two decimals.'
+      });
+    }
+
+    const booking = await Booking.findById(req.params.id);
+    if (!booking) {
+      return res.status(404).json({ message: 'Booking not found.' });
+    }
+    if (booking.status === 'cancelled' || booking.paymentStatus === 'paid') {
+      return res.status(409).json({
+        message: 'Cannot change the quote for a cancelled or paid booking.'
+      });
+    }
+
+    booking.quotedAmountPaise = Math.round(amount * 100);
+    booking.paymentMethod = null;
+    booking.paymentStatus = 'not_started';
+    booking.razorpayOrderId = null;
+    booking.razorpayPaymentId = null;
+    booking.paymentUpdatedAt = new Date();
+    await booking.save();
+
+    return res.json({
+      message: 'Service quote saved.',
+      bookingId: String(booking._id),
+      quotedAmountPaise: booking.quotedAmountPaise,
+      currency: 'INR',
+      paymentStatus: booking.paymentStatus,
+    });
+  } catch (error) {
+    console.error('Admin quote update error:', error.message);
+    return res.status(500).json({ message: 'Unable to save the service quote.' });
+  }
+});
+
+// Admin confirms cash was actually collected after service.
+app.post('/api/admin/bookings/:id/payment/cash/collect', requireAdminKey, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid booking ID.' });
+    }
+
+    const booking = await Booking.findOneAndUpdate(
+      {
+        _id: req.params.id,
+        paymentMethod: 'cash_on_service',
+        paymentStatus: 'pending_collection',
+      },
+      { $set: { paymentStatus: 'paid', paymentUpdatedAt: new Date() } },
+      { new: true, runValidators: true }
+    );
+
+    if (!booking) {
+      return res.status(409).json({
+        message: 'No matching cash payment is awaiting collection.'
+      });
+    }
+
+    return res.json({
+      message: 'Cash collection recorded.',
+      bookingId: String(booking._id),
+      paymentStatus: booking.paymentStatus,
+    });
+  } catch (error) {
+    console.error('Cash collection recording error:', error.message);
+    return res.status(500).json({ message: 'Unable to record cash collection.' });
+  }
+});
+
 
 app.get('/api/admin/bookings', requireAdminKey, async (req, res) => {
   try {
