@@ -3,6 +3,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');
 const cors = require('cors');
+const crypto = require('crypto');
 
 dotenv.config();
 
@@ -160,15 +161,119 @@ app.post('/api/bookings/status', async (req, res) => {
   }
 });
 
+function safeEqualStrings(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const left = Buffer.from(a, 'utf8');
+  const right = Buffer.from(b, 'utf8');
+  return left.length === right.length &&
+    crypto.timingSafeEqual(left, right);
+}
+
+function verifyAdminToken(token) {
+  const secret = process.env.ADMIN_SESSION_SECRET;
+  if (!secret || typeof token !== 'string') return false;
+
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+
+  const [payloadPart, suppliedSignature] = parts;
+  const expectedSignature = crypto
+    .createHmac('sha256', secret)
+    .update(payloadPart)
+    .digest('base64url');
+
+  if (!safeEqualStrings(suppliedSignature, expectedSignature)) {
+    return false;
+  }
+
+  try {
+    const payload = JSON.parse(
+      Buffer.from(payloadPart, 'base64url').toString('utf8')
+    );
+    return payload.role === 'admin' &&
+      Number.isFinite(payload.exp) &&
+      payload.exp > Math.floor(Date.now() / 1000);
+  } catch {
+    return false;
+  }
+}
+
+const adminLoginFailures = new Map();
+
+app.post('/api/admin/login', (req, res) => {
+  const configuredPassword = process.env.ADMIN_LOGIN_PASSWORD;
+  const secret = process.env.ADMIN_SESSION_SECRET;
+
+  if (!configuredPassword || !secret) {
+    return res.status(503).json({
+      message: 'Admin login is not configured.'
+    });
+  }
+
+  const now = Date.now();
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const record = adminLoginFailures.get(ip);
+
+  if (record && record.blockedUntil > now) {
+    return res.status(429).json({
+      message: 'Too many failed attempts. Try again later.'
+    });
+  }
+
+  if (!safeEqualStrings(req.body?.password, configuredPassword)) {
+    const inWindow = record && now - record.windowStart < 15 * 60 * 1000;
+    const failures = inWindow ? record.failures + 1 : 1;
+    const windowStart = inWindow ? record.windowStart : now;
+
+    adminLoginFailures.set(ip, {
+      failures,
+      windowStart,
+      blockedUntil: failures >= 8 ? now + 15 * 60 * 1000 : 0
+    });
+
+    return res.status(failures >= 8 ? 429 : 401).json({
+      message: failures >= 8
+        ? 'Too many failed attempts. Try again later.'
+        : 'Invalid credentials.'
+    });
+  }
+
+  adminLoginFailures.delete(ip);
+
+  const payloadPart = Buffer.from(JSON.stringify({
+    role: 'admin',
+    exp: Math.floor(now / 1000) + 8 * 60 * 60
+  })).toString('base64url');
+
+  const signature = crypto
+    .createHmac('sha256', secret)
+    .update(payloadPart)
+    .digest('base64url');
+
+  return res.json({
+    token: `${payloadPart}.${signature}`,
+    expiresIn: 28800
+  });
+});
+
 function requireAdminKey(req, res, next) {
   const expectedKey = process.env.ADMIN_API_KEY;
   const providedKey = req.get('x-admin-key');
 
-  if (!expectedKey || !providedKey || providedKey !== expectedKey) {
-    return res.status(401).json({ message: 'Unauthorized.' });
+  // Preserve compatibility with the existing web admin.
+  if (expectedKey && safeEqualStrings(providedKey, expectedKey)) {
+    return next();
   }
 
-  next();
+  // Also allow a valid, unexpired token from the admin app.
+  const authorization = req.get('authorization') || '';
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+
+  if (match && verifyAdminToken(match[1])) {
+    return next();
+  }
+
+  return res.status(401).json({ message: 'Unauthorized.' });
 }
 
 app.get('/api/admin/bookings', requireAdminKey, async (req, res) => {
