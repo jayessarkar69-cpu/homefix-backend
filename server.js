@@ -357,111 +357,61 @@ app.post('/api/bookings', requireCustomer, async (req, res) => {
 // Allow customers to check their booking using their booking ID and phone.
 app.post('/api/bookings/status', requireCustomer, async (req, res) => {
   try {
-    const bookingId = String(req.body.bookingId || '').trim();
     const phone = String(req.body.phone || '').trim();
 
-    if (!mongoose.isValidObjectId(bookingId) ||
-        !/^\d{10}$/.test(phone)) {
+    if (!/^\d{10}$/.test(phone)) {
       return res.status(400).json({
-        message: 'Enter a valid booking ID and 10-digit phone number.',
+        message: 'Enter your 10-digit mobile number.'
       });
     }
 
-    const accountPhone = customerLocalPhone(req.customer.phoneNumber);
-    if (!accountPhone || accountPhone !== phone) {
+    const verifiedPhone = customerLocalPhone(req.customer.phoneNumber);
+
+    if (!verifiedPhone || phone !== verifiedPhone) {
       return res.status(403).json({
-        message: 'Use the phone number verified in your HomeFix account.'
+        message: 'Enter the mobile number verified in your HomeFix account.'
       });
     }
 
-    // Look up bookings owned by this signed-in customer.
-    let booking = await Booking.findOne({
-      _id: bookingId,
-      phone,
+    // Associate eligible legacy bookings using the verified phone number.
+    await Booking.updateMany(
+      {
+        phone,
+        $or: [
+          { customerUid: { $exists: false } },
+          { customerUid: null }
+        ]
+      },
+      { $set: { customerUid: req.customer.uid } }
+    );
+
+    const bookings = await Booking.find({
       customerUid: req.customer.uid,
+      phone
     })
       .select('service date time status createdAt')
+      .sort({ createdAt: -1 })
+      .limit(100)
       .lean();
 
-    // Safely associate an older, unlinked booking only when its phone
-    // matches this customer's verified Firebase phone number.
-    if (!booking) {
-      booking = await Booking.findOneAndUpdate(
-        {
-          _id: bookingId,
-          phone,
-          $or: [
-            { customerUid: { $exists: false } },
-            { customerUid: null },
-          ],
-        },
-        { $set: { customerUid: req.customer.uid } },
-        { new: true }
-      )
-        .select('service date time status createdAt')
-        .lean();
-    }
-
-    if (!booking) {
-      return res.status(404).json({
-        message: 'Booking not found. Check your booking ID and phone number.',
-      });
-    }
-
     return res.json({
-      bookingId: String(booking._id),
-      service: booking.service,
-      date: booking.date,
-      time: booking.time,
-      status: booking.status,
-      createdAt: booking.createdAt,
+      bookings: bookings.map(booking => ({
+        bookingId: String(booking._id),
+        service: booking.service,
+        date: booking.date,
+        time: booking.time,
+        status: booking.status,
+        createdAt: booking.createdAt
+      }))
     });
   } catch (error) {
     console.error('Customer status lookup error:', error.message);
     return res.status(500).json({
-      message: 'Unable to check booking status right now.',
+      message: 'Unable to check booking status right now.'
     });
   }
 });
 
-function safeEqualStrings(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const left = Buffer.from(a, 'utf8');
-  const right = Buffer.from(b, 'utf8');
-  return left.length === right.length &&
-    crypto.timingSafeEqual(left, right);
-}
-
-function verifyAdminToken(token) {
-  const secret = process.env.ADMIN_SESSION_SECRET;
-  if (!secret || typeof token !== 'string') return false;
-
-  const parts = token.split('.');
-  if (parts.length !== 2) return false;
-
-  const [payloadPart, suppliedSignature] = parts;
-  const expectedSignature = crypto
-    .createHmac('sha256', secret)
-    .update(payloadPart)
-    .digest('base64url');
-
-  if (!safeEqualStrings(suppliedSignature, expectedSignature)) {
-    return false;
-  }
-
-  try {
-    const payload = JSON.parse(
-      Buffer.from(payloadPart, 'base64url').toString('utf8')
-    );
-    return payload.role === 'admin' &&
-      Number.isFinite(payload.exp) &&
-      payload.exp > Math.floor(Date.now() / 1000);
-  } catch {
-    return false;
-  }
-}
-
-const adminLoginFailures = new Map();
 
 app.post('/api/admin/login', (req, res) => {
   const configuredPassword = process.env.ADMIN_LOGIN_PASSWORD;
