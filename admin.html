@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HomeFix Admin</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f3f6fb;color:#17243b;font-family:Arial,sans-serif}
+header{background:#153e75;color:white;padding:24px}
+header h1{margin:0 0 6px;font-size:26px}
+header p{margin:0;color:#d9e7ff}
+main{max-width:950px;margin:24px auto;padding:0 16px}
+.panel,.booking{background:white;border:1px solid #e1e7f0;border-radius:14px;padding:20px;margin-bottom:16px}
+label{display:block;font-weight:600;margin-bottom:8px}
+input,select,button{font:inherit;border-radius:9px;padding:11px;border:1px solid #ccd5e2}
+input{width:100%;margin-bottom:12px}
+button{background:#153e75;color:white;border:0;cursor:pointer;font-weight:600}
+button:disabled{opacity:.6;cursor:wait}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.row select{flex:1;min-width:150px;background:white}
+#message{margin:12px 0;white-space:pre-wrap}
+.booking h3{margin:0 0 12px}
+.booking p{margin:7px 0;overflow-wrap:anywhere}
+.muted{color:#65738a;font-size:13px}
+.status{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:15px}
+.status label{margin:0}
+#bookings{margin-top:18px}
+</style>
+</head>
+<body>
+<header>
+  <h1>HomeFix Admin</h1>
+  <p>Agartala · Service booking management</p>
+</header>
+<main>
+  <section class="panel">
+    <label for="adminKey">Admin access key</label>
+    <input id="adminKey" type="password" autocomplete="off"
+      placeholder="Enter your private admin key">
+    <button id="loadButton">Load bookings</button>
+    <div id="message" role="status"></div>
+    <p class="muted">Your key is used for requests from this page and is not saved to browser storage.</p>
+  </section>
+  <section id="bookings" aria-live="polite"></section>
+</main>
+<script>
+const keyInput = document.getElementById('adminKey');
+const loadButton = document.getElementById('loadButton');
+const message = document.getElementById('message');
+const bookingsBox = document.getElementById('bookings');
+const statuses = ['pending', 'accepted', 'completed', 'cancelled'];
+
+function showMessage(text, isError = false) {
+  message.textContent = text;
+  message.style.color = isError ? '#b42318' : '#176b3a';
+}
+
+async function loadBookings() {
+  const key = keyInput.value.trim();
+  if (!key) {
+    showMessage('Enter your admin key first.', true);
+    keyInput.focus();
+    return;
+  }
+
+  loadButton.disabled = true;
+  showMessage('Loading bookings...');
+  bookingsBox.replaceChildren();
+
+  try {
+    const response = await fetch('/api/admin/bookings', {
+      headers: {'x-admin-key': key}
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.message || 'Could not load bookings.');
+
+    if (!Array.isArray(data.bookings) || data.bookings.length === 0) {
+      showMessage('No bookings found.');
+      return;
+    }
+
+    showMessage('Loaded ' + data.bookings.length + ' booking(s).');
+    for (const booking of data.bookings) {
+      bookingsBox.appendChild(createBookingCard(booking, key));
+    }
+  } catch (error) {
+    showMessage(error.message || 'Could not reach the backend.', true);
+  } finally {
+    loadButton.disabled = false;
+  }
+}
+
+function addDetail(card, label, value) {
+  const p = document.createElement('p');
+  const strong = document.createElement('strong');
+  strong.textContent = label + ': ';
+  p.append(strong, document.createTextNode(value || '—'));
+  card.appendChild(p);
+}
+
+function createBookingCard(booking, key) {
+  const card = document.createElement('article');
+  card.className = 'booking';
+
+  const heading = document.createElement('h3');
+  heading.textContent = (booking.service || 'Service') + ' — ' +
+    (booking.customerName || 'Customer');
+  card.appendChild(heading);
+
+  addDetail(card, 'Booking ID', booking._id);
+  addDetail(card, 'Phone', booking.phone);
+  addDetail(card, 'Address', booking.address);
+  addDetail(card, 'Date', booking.date);
+  addDetail(card, 'Time', booking.time);
+  addDetail(card, 'Problem', booking.problem);
+  addDetail(card, 'Current status', booking.status);
+
+  const controls = document.createElement('div');
+  controls.className = 'status';
+
+  const label = document.createElement('label');
+  label.textContent = 'Change status';
+  const select = document.createElement('select');
+  select.setAttribute('aria-label', 'New status');
+
+  for (const status of statuses) {
+    const option = document.createElement('option');
+    option.value = status;
+    option.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+    option.selected = status === booking.status;
+    select.appendChild(option);
+  }
+
+  const button = document.createElement('button');
+  button.textContent = 'Update status';
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      const response = await fetch(
+        '/api/admin/bookings/' + encodeURIComponent(booking._id) + '/status',
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-admin-key': key
+          },
+          body: JSON.stringify({status: select.value})
+        }
+      );
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || 'Update failed.');
+      showMessage('Booking status updated successfully.');
+      await loadBookings();
+    } catch (error) {
+      showMessage(error.message || 'Could not update status.', true);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  controls.append(label, select, button);
+  card.appendChild(controls);
+  return card;
+}
+
+loadButton.addEventListener('click', loadBookings);
+</script>
+</body>
+</html>
