@@ -630,6 +630,62 @@ app.post('/api/bookings/status', requireCustomer, async (req, res) => {
 });
 
 
+
+// Admin login security helpers.
+const adminLoginFailures = new Map();
+
+function safeEqualStrings(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') {
+    return false;
+  }
+
+  const left = Buffer.from(a, 'utf8');
+  const right = Buffer.from(b, 'utf8');
+
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(left, right);
+}
+
+function verifyAdminToken(token) {
+  const secret = process.env.ADMIN_SESSION_SECRET;
+
+  if (!secret || typeof token !== 'string') {
+    return false;
+  }
+
+  const parts = token.split('.');
+  if (parts.length !== 2) {
+    return false;
+  }
+
+  const [payloadPart, suppliedSignature] = parts;
+
+  const expectedSignature = crypto
+    .createHmac('sha256', secret)
+    .update(payloadPart)
+    .digest('base64url');
+
+  if (!safeEqualStrings(suppliedSignature, expectedSignature)) {
+    return false;
+  }
+
+  try {
+    const payload = JSON.parse(
+      Buffer.from(payloadPart, 'base64url').toString('utf8')
+    );
+
+    return payload.role === 'admin' &&
+      Number.isFinite(payload.exp) &&
+      payload.exp > Math.floor(Date.now() / 1000);
+  } catch (_) {
+    return false;
+  }
+}
+
+
 app.post('/api/admin/login', (req, res) => {
   const configuredPassword = process.env.ADMIN_LOGIN_PASSWORD;
   const secret = process.env.ADMIN_SESSION_SECRET;
