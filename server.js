@@ -14,7 +14,11 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) res.set('Cache-Control', 'no-store');
+  next();
+});
 
 const bookingSchema = new mongoose.Schema(
   {
@@ -51,7 +55,25 @@ const bookingSchema = new mongoose.Schema(
       default: '',
       trim: true,
     },
+    alternatePhone: { type: String, default: '' },
+    workerSettlement: { type: new mongoose.Schema({
+      grossPaise: Number, commissionPaise: Number, earningsPaise: Number, cashHeldPaise: Number, settledAt: Date,
+    }, { _id: false }), default: null },
     customerUid: { type: String, required: false, index: true },
+    assignedWorkerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Worker', default: null, index: true },
+    assignedWorkerName: { type: String, default: null },
+    assignedAt: { type: Date, default: null },
+    completedAt: { type: Date, default: null },
+    paidAt: { type: Date, default: null },
+    cashCollection: { type: new mongoose.Schema({
+      workerId: mongoose.Schema.Types.ObjectId, workerName: String, amountPaise: Number,
+      status: { type: String, enum: ['awaiting_customer', 'customer_confirmed'] },
+      requestedAt: Date, confirmedAt: Date,
+    }, { _id: false }), default: null },
+    paymentHistory: { type: [{
+      _id: false, status: String, method: String, amountPaise: Number,
+      recordedAt: Date, reference: String,
+    }], default: [] },
     quotedAmountPaise: { type: Number, min: 0, default: null },
     paymentMethod: {
       type: String,
@@ -72,9 +94,24 @@ const bookingSchema = new mongoose.Schema(
       default: 'pending',
     },
   },
-  { timestamps: true }
+  { timestamps: true, optimisticConcurrency: true }
 );
 
+// Every atomic booking update invalidates stale in-flight saves (for example a quote
+// loaded before the customer confirmed cash). Prevents a later save undoing payment.
+bookingSchema.pre('findOneAndUpdate', function () {
+  const update = this.getUpdate();
+  update.$inc = { ...update.$inc, __v: 1 };
+});
+// Keep payment events when the current quote or method changes.
+bookingSchema.pre('save', function () {
+  if (this.isNew || !['paymentStatus', 'quotedAmountPaise', 'paymentMethod', 'razorpayPaymentId']
+      .some(field => this.isModified(field))) return;
+  const now = new Date();
+  this.paymentHistory.push({ status: this.paymentStatus, method: this.paymentMethod,
+    amountPaise: this.quotedAmountPaise, recordedAt: now, reference: this.razorpayPaymentId });
+  if (this.paymentStatus === 'paid' && !this.paidAt) this.paidAt = now;
+});
 const Booking = mongoose.model('Booking', bookingSchema);
 
 const customerAddressSchema = new mongoose.Schema({
@@ -93,6 +130,8 @@ const customerSchema = new mongoose.Schema({
   name: { type: String, default: '', trim: true, maxlength: 80 },
   phone: { type: String, default: '', trim: true },
   email: { type: String, default: '', trim: true, lowercase: true, maxlength: 254 },
+  alternatePhone: { type: String, default: '' },
+  photoData: { type: String, default: '' },
   addresses: { type: [customerAddressSchema], default: [] }
 }, { timestamps: true });
 
@@ -196,6 +235,17 @@ app.patch('/api/customer/me', requireCustomer, async (req, res) => {
       updates.email = email;
     }
 
+    if (req.body.alternatePhone !== undefined) {
+      const phone = String(req.body.alternatePhone).trim();
+      if (phone && !/^\d{10}$/.test(phone)) return res.status(400).json({ message: 'Enter a valid 10-digit alternate phone.' });
+      updates.alternatePhone = phone;
+    }
+    if (req.body.photoData !== undefined) {
+      if (req.body.photoData !== '' && !require('./business-tools').validateImage(req.body.photoData, 250000)) {
+        return res.status(400).json({ message: 'Choose a JPEG or PNG profile photo smaller than 250 KB.' });
+      }
+      updates.photoData = req.body.photoData;
+    }
     if (!Object.keys(updates).length) {
       return res.status(400).json({ message: 'Provide a name or email to update.' });
     }
@@ -341,7 +391,10 @@ app.post('/api/bookings', requireCustomer, async (req, res) => {
       });
     }
 
+    const alternatePhone = String(req.body.alternatePhone || '').trim();
+    if (alternatePhone && !/^\d{10}$/.test(alternatePhone)) return res.status(400).json({ message: 'Enter a valid alternate phone.' });
     const booking = await Booking.create({
+      alternatePhone,
       customerUid: req.customer.uid,
       customerName,
       phone: String(phone),
@@ -397,6 +450,7 @@ app.post('/api/bookings/:id/payment/cash', requireCustomer, async (req, res) => 
       return res.status(409).json({ message: 'This booking is already paid.' });
     }
 
+    booking.cashCollection = null;
     booking.paymentMethod = 'cash_on_service';
     booking.paymentStatus = 'pending_collection';
     booking.razorpayOrderId = null;
@@ -461,6 +515,7 @@ app.post('/api/payments/razorpay/order', requireCustomer, async (req, res) => {
       },
     });
 
+    booking.cashCollection = null;
     booking.paymentMethod = 'razorpay';
     booking.paymentStatus = 'created';
     booking.razorpayOrderId = order.id;
@@ -795,6 +850,7 @@ app.patch('/api/admin/bookings/:id/quote', requireAdminKey, async (req, res) => 
       });
     }
 
+    booking.cashCollection = null;
     booking.quotedAmountPaise = Math.round(amount * 100);
     booking.paymentMethod = null;
     booking.paymentStatus = 'not_started';
@@ -827,9 +883,12 @@ app.post('/api/admin/bookings/:id/payment/cash/collect', requireAdminKey, async 
       {
         _id: req.params.id,
         paymentMethod: 'cash_on_service',
+        status: { $ne: 'cancelled' },
         paymentStatus: 'pending_collection',
       },
-      { $set: { paymentStatus: 'paid', paymentUpdatedAt: new Date() } },
+      { $set: { paymentStatus: 'paid', paymentUpdatedAt: new Date(), paidAt: new Date(), cashCollection: null },
+        $push: { paymentHistory: { status: 'paid', method: 'cash_on_service',
+          recordedAt: new Date() } } },
       { new: true, runValidators: true }
     );
 
@@ -878,14 +937,14 @@ app.patch('/api/admin/bookings/:id/status', requireAdminKey, async (req, res) =>
       return res.status(400).json({ message: 'Invalid booking status.' });
     }
 
-    const booking = await Booking.findByIdAndUpdate(
-      req.params.id,
-      { status },
+    const booking = await Booking.findOneAndUpdate(
+      { _id: req.params.id, 'workerSettlement.settledAt': null },
+      { $set: { status, completedAt: status === 'completed' ? new Date() : null } },
       { new: true, runValidators: true }
     );
 
     if (!booking) {
-      return res.status(404).json({ message: 'Booking not found.' });
+      return res.status(404).json({ message: 'Booking not found or earnings already settled.' });
     }
 
     return res.json({
@@ -899,6 +958,10 @@ app.patch('/api/admin/bookings/:id/status', requireAdminKey, async (req, res) =>
     console.error('Admin update error:', error.message);
     return res.status(500).json({ message: 'Unable to update booking.' });
   }
+});
+
+require('./team-history').registerTeamHistory({
+  app, mongoose, Booking, Customer, requireAdminKey, requireCustomer, customerLocalPhone,
 });
 
 app.get('/admin', (req, res) => {
