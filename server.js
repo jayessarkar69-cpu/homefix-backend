@@ -66,9 +66,11 @@ const bookingSchema = new mongoose.Schema(
     completionOtpIssuedAt: Date, completionOtpWindowAt: Date,
     completionOtpIssueCount: { type: Number, default: 0 }, completionOtpAttempts: { type: Number, default: 0 },
     workStartedAt: { type: Date, default: null }, quoteAcceptedAt: { type: Date, default: null }, acceptedQuotePaise: Number,
-    review: { type: new mongoose.Schema({ stars: Number, comment: String, public: Boolean, createdAt: Date }, { _id: false }), default: null },
+    review: { type: new mongoose.Schema({ stars: Number, workerStars: Number, comment: String, public: Boolean, createdAt: Date }, { _id: false }), default: null },
     termsAcceptedAt: Date, termsVersion: String,
     alternatePhone: { type: String, default: '' },
+    commissionMode: { type: String, enum: ['percent','fixed'], default: 'percent' }, commissionValue: { type: Number, default: 20 },
+    workerPriceAcceptedAt: Date, workerAcceptedPricePaise: Number,
     workerSettlement: { type: new mongoose.Schema({
       grossPaise: Number, commissionPaise: Number, earningsPaise: Number, cashHeldPaise: Number, settledAt: Date,
     }, { _id: false }), default: null },
@@ -139,6 +141,7 @@ const customerAddressSchema = new mongoose.Schema({
 });
 
 const customerSchema = new mongoose.Schema({
+  smsUpdates: { type: Boolean, default: false }, smsConsentAt: Date,
   firebaseUid: { type: String, required: true, unique: true, index: true },
   name: { type: String, default: '', trim: true, maxlength: 80 },
   phone: { type: String, default: '', trim: true },
@@ -437,6 +440,7 @@ app.post('/api/bookings', requireCustomer, async (req, res) => {
     });
 
     if (app.locals.notifyBooking) await app.locals.notifyBooking(booking).catch(() => {});
+    await app.locals.sendServiceSms?.(booking, 'booking');
     return res.status(201).json({
       message: 'Booking saved successfully!',
       bookingId: booking._id,
@@ -651,6 +655,8 @@ app.post('/api/payments/razorpay/verify', requireCustomer, async (req, res) => {
     booking.paymentUpdatedAt = new Date();
     await booking.save();
 
+    await app.locals.autoSettle?.(booking._id).catch(() => {});
+    await app.locals.notifyServiceEvent?.(booking, 'payment_received');
     return res.json({
       message: 'Payment verified successfully.',
       paymentStatus: booking.paymentStatus,
@@ -886,10 +892,15 @@ app.patch('/api/admin/bookings/:id/quote', requireAdminKey, async (req, res) => 
       });
     }
 
+    booking.workerPriceAcceptedAt = null;
+    booking.workerAcceptedPricePaise = null;
     booking.quoteAcceptedAt = null;
     booking.acceptedQuotePaise = null;
     booking.cashCollection = null;
     booking.quotedAmountPaise = Math.round(amount * 100);
+    const pricingSettings = await mongoose.models.BusinessSettings.findById('main').lean();
+    booking.commissionMode = 'percent';
+    booking.commissionValue = pricingSettings?.commissionPercent ?? 20;
     booking.paymentMethod = null;
     booking.paymentStatus = 'not_started';
     booking.razorpayOrderId = null;
@@ -897,8 +908,9 @@ app.patch('/api/admin/bookings/:id/quote', requireAdminKey, async (req, res) => 
     booking.paymentUpdatedAt = new Date();
     await booking.save();
 
+    await app.locals.notifyServiceEvent?.(booking, 'price_updated');
     return res.json({
-      message: 'Service quote saved.',
+      message: 'Service price saved.',
       bookingId: String(booking._id),
       quotedAmountPaise: booking.quotedAmountPaise,
       currency: 'INR',
@@ -936,6 +948,8 @@ app.post('/api/admin/bookings/:id/payment/cash/collect', requireAdminKey, async 
       });
     }
 
+    await app.locals.autoSettle?.(booking._id).catch(() => {});
+    await app.locals.notifyServiceEvent?.(booking, 'payment_received');
     return res.json({
       message: 'Cash collection recorded.',
       bookingId: String(booking._id),

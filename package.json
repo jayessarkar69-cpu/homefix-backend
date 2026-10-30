@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test business-tools.test.js team-history.test.js service-operations.test.js",
+    "test": "node --test business-tools.test.js team-history.test.js service-operations.test.js workforce.test.js wallet-automation.test.js service-sms.test.js",
     "start": "node server.js"
   },
   "keywords": [],

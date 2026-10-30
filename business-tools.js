@@ -85,7 +85,7 @@ function registerBusinessTools({ app, mongoose, Booking, Worker, Customer, requi
     let privateStorageReady = false;
     try { dataKey(); privateStorageReady = true; } catch (_) {}
     res.json({ privateStorageReady, supportPhone: settings?.supportPhone || '9863902010', commissionPercent: settings?.commissionPercent ?? 20,
-      featureVersion: 4, completionCodes: 'customer_app', dispatchModes: ['first_claim','admin_assign'], policyVersion: '2026-10-30-v4', identityReview: 'manual', withdrawals: 'manual_admin_payment' });
+      featureVersion: 5, smsReady: app.locals.smsReady?.() || false, completionCodes: 'customer_app', dispatchModes: ['first_claim','admin_assign'], policyVersion: '2026-10-30-v5', identityReview: 'manual', withdrawals: 'manual_admin_payment' });
   }));
   app.patch('/api/admin/settings', requireAdminKey, wrap(async (req, res) => {
     const phone = req.body?.supportPhone;
@@ -96,32 +96,18 @@ function registerBusinessTools({ app, mongoose, Booking, Worker, Customer, requi
     const settings = await Settings.findByIdAndUpdate('main', { supportPhone: phone, commissionPercent: percent }, { upsert: true, new: true, runValidators: true });
     res.json({ settings });
   }));
-  app.post('/api/worker/register', wrap(async (req, res) => {
-    if (!process.env.ADMIN_SESSION_SECRET) return res.status(503).json({ message: 'Worker login is not configured.' });
-    if (!limit(req.ip || 'unknown')) return res.status(429).json({ message: 'Too many attempts. Try later.' });
-    const name = String(req.body?.name || '').trim(), phone = String(req.body?.phone || '').trim();
-    const password = req.body?.password;
-    if (!name || name.length > 100 || !/^\d{10}$/.test(phone) || typeof password !== 'string' || password.length < 10 || password.length > 128) {
-      return res.status(400).json({ message: 'Enter a name, 10-digit phone and password of 10–128 characters.' });
-    }
-    const salt = crypto.randomBytes(16).toString('hex');
-    try {
-      await Worker.init();
-      await Worker.create({ name, phone, salt, passwordHash: await hashPassword(password, salt), verificationStatus: 'not_submitted' });
-      res.status(201).json({ message: 'Account created. Sign in, submit your ID and payout details, then wait for Admin approval.' });
-    } catch (error) {
-      if (error.code === 11000) return res.status(409).json({ message: 'This phone is already registered. Sign in or contact Admin.' });
-      throw error;
-    }
-  }));
+  app.post('/api/worker/register',wrap(async(_req,res)=>res.status(426).json({message:'Update HomeFix Team and use verified mobile sign-in to join.'})));
   app.get('/api/worker/me', requireWorker, wrap(async (req, res) => {
+    const pending=await Booking.find({assignedWorkerId:req.worker._id,status:'completed',paymentStatus:'paid',completionVerifiedAt:{$ne:null},workerPriceAcceptedAt:{$ne:null},'workerSettlement.settledAt':null}).select('_id').limit(20).lean();
+    for(const job of pending)await app.locals.autoSettle(job._id).catch(()=>{});
+    const freshWorker=await Worker.findById(req.worker._id).lean();
     const [settlements, withdrawals, totalJobs, completedJobs] = await Promise.all([
       Settlement.find({ workerId: req.worker._id }).sort({ createdAt: -1 }).limit(50).lean(),
       Withdrawal.find({ workerId: req.worker._id }).sort({ createdAt: -1 }).limit(50).lean(),
       Booking.countDocuments({ assignedWorkerId: req.worker._id }),
       Booking.countDocuments({ assignedWorkerId: req.worker._id, status: 'completed' }),
     ]);
-    res.json({ worker: publicWorker(req.worker), wallet: walletView(req.worker), settlements, withdrawals,
+    res.json({ worker: publicWorker(req.worker), wallet: walletView(freshWorker||req.worker), settlements, withdrawals,
       work: { totalJobs, completedJobs } });
   }));
   app.post('/api/worker/identity', requireWorker, wrap(async (req, res) => {
@@ -181,14 +167,14 @@ function registerBusinessTools({ app, mongoose, Booking, Worker, Customer, requi
     if (!worker) return res.status(409).json({ message: 'Review the document before removing its stored image.' });
     res.json({ worker: publicWorker(worker) });
   }));
-  app.post('/api/admin/bookings/:id/settlement', requireAdminKey, moneyWrap(async (req, res) => {
-    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid booking.' });
-    const result = await transaction(async session => {
-      const booking = await Booking.findOne({ _id: req.params.id, status: 'completed', paymentStatus: 'paid',
-        assignedWorkerId: { $ne: null }, 'workerSettlement.settledAt': null }).session(session);
+  async function settleBooking(id,mode,value,automatic=false) {
+    return transaction(async session => {
+      const booking = await Booking.findOne({ _id: id, status: 'completed', paymentStatus: 'paid',
+        assignedWorkerId: { $ne: null }, 'workerSettlement.settledAt': null, ...(automatic?{completionVerifiedAt:{$ne:null},workerPriceAcceptedAt:{$ne:null}}:{}) }).session(session);
       if (!booking) fail(409, 'Job must be completed, paid, assigned and not already settled.');
+      if(booking.workerPriceAcceptedAt&&(mode!==(booking.commissionMode||'percent')||value!==(booking.commissionValue??20)))fail(409,'The worker-approved commission cannot be changed after service completion.');
       let values;
-      try { values = settlementAmounts(booking.quotedAmountPaise, req.body?.mode, req.body?.value); }
+      try { values = settlementAmounts(booking.quotedAmountPaise, mode, value); }
       catch (_) { fail(400, 'Enter a valid commission. Fixed amounts must be in paise.'); }
       const worker = await Worker.findById(booking.assignedWorkerId).session(session);
       if (!worker || worker.verificationStatus !== 'approved') fail(409, 'Verify the worker identity before settling earnings.');
@@ -205,8 +191,29 @@ function registerBusinessTools({ app, mongoose, Booking, Worker, Customer, requi
       } }, { session });
       return record;
     });
-    res.json({ settlement: result });
+  }
+  app.locals = app.locals || {};
+  app.locals.autoSettle = async id => {
+    const booking = await Booking.findOne({_id:id,status:'completed',paymentStatus:'paid',completionVerifiedAt:{$ne:null},workerPriceAcceptedAt:{$ne:null},'workerSettlement.settledAt':null});
+    if(!booking)return null;
+    try { return await settleBooking(id,booking.commissionMode||'percent',booking.commissionValue??20,true); }
+    catch(error) { if(error.code===11000||error.status===409)return null; throw error; }
+  };
+  app.post('/api/admin/bookings/:id/settlement', requireAdminKey, moneyWrap(async (req,res)=>{
+    if(!mongoose.isValidObjectId(req.params.id))return res.status(400).json({message:'Invalid booking.'});
+    const result=await settleBooking(req.params.id,req.body?.mode,req.body?.value);
+    res.json({settlement:result});
   }));
+  app.patch('/api/admin/bookings/:id/commission',requireAdminKey,moneyWrap(async(req,res)=>{
+    if(!mongoose.isValidObjectId(req.params.id))return res.status(400).json({message:'Invalid booking.'});
+    const booking=await Booking.findOne({_id:req.params.id,status:{$nin:['completed','cancelled']},workStartedAt:null});
+    if(!booking)return res.status(409).json({message:'Commission is locked after work starts.'});
+    try{settlementAmounts(booking.quotedAmountPaise,req.body?.mode,req.body?.value);}catch(_){return res.status(400).json({message:'Enter a valid commission.'});}
+    const updated=await Booking.findOneAndUpdate({_id:booking._id,workStartedAt:null,status:{$nin:['completed','cancelled']}},{$set:{commissionMode:req.body.mode,commissionValue:req.body.value,workerPriceAcceptedAt:null,workerAcceptedPricePaise:null},$inc:{__v:1}},{new:true});
+    if(!updated)return res.status(409).json({message:'Order changed.'});res.json({message:'Commission updated. Worker must approve the service price again.'});
+  }));
+  require('./workforce').registerWorkforce({app,mongoose,Worker,Booking,requireWorker,requireCustomer,requireAdminKey,wrap,publicWorker});
+  require('./service-sms').registerServiceSms({app,mongoose,Customer,requireCustomer,requireAdminKey,wrap});
   app.post('/api/worker/withdrawals', requireWorker, moneyWrap(async (req, res) => {
     const amount = req.body?.amountPaise;
     if (!Number.isSafeInteger(amount) || amount <= 0) return res.status(400).json({ message: 'Enter a positive withdrawal amount.' });

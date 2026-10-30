@@ -2,13 +2,13 @@
 const crypto = require('crypto');
 const { encryptPrivate, decryptPrivate, validateImage } = require('./business-tools');
 const SERVICES = ['Plumbing','Electrician','AC Repair','Appliance Repair','Home Cleaning','Painting'];
-const POLICY_VERSION = '2026-10-30-v4';
+const POLICY_VERSION = '2026-10-30-v5';
 function validPin(pin) {
   return pin && typeof pin.latitude === 'number' && typeof pin.longitude === 'number' &&
     Number.isFinite(pin.latitude) && Number.isFinite(pin.longitude) && Math.abs(pin.latitude) <= 90 && Math.abs(pin.longitude) <= 180;
 }
 function eligible(worker, service, now = new Date()) {
-  return !!(worker?.active && worker.phoneVerified && worker.verificationStatus === 'approved' && worker.payoutSummary &&
+  return !!(worker?.active && worker.phoneVerified && worker.hasProfilePhoto && worker.verificationStatus === 'approved' && worker.payoutSummary &&
     worker.online && new Date(worker.availableUntil) > now && worker.approvedSkills?.includes(service));
 }
 function completionHash(id, code) {
@@ -34,14 +34,14 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
     ownerRole: String, ownerId: String, lastSeenAt: Date, targetType: { type: String, enum: ['fid','token'], default: 'fid' },
   }));
   const Ticket = mongoose.models.SupportTicket || mongoose.model('SupportTicket', new mongoose.Schema({
-    ownerRole: String, ownerId: { type: String, index: true }, bookingId: mongoose.Schema.Types.ObjectId,
+    ownerRole: String, ownerId: { type: String, index: true }, ownerName: String, ownerPhone: String, bookingId: mongoose.Schema.Types.ObjectId,
     subject: String, status: { type: String, default: 'open' },
     messages: [{ _id: false, role: String, text: String, createdAt: Date }],
     photoEncrypted: { type: mongoose.Schema.Types.Mixed, select: false },
   }, { timestamps: true }));
   const Review = mongoose.models.ServiceReview || mongoose.model('ServiceReview', new mongoose.Schema({
     bookingId: { type: mongoose.Schema.Types.ObjectId, required: true, unique: true },
-    customerUid: { type: String, index: true }, service: String, stars: { type: Number, min: 1, max: 5 },
+    customerUid: { type: String, index: true }, workerId: { type: mongoose.Schema.Types.ObjectId, index: true }, workerStars: { type: Number, min: 1, max: 5 }, service: String, stars: { type: Number, min: 1, max: 5 },
     comment: { type: String, maxlength: 1500 }, public: { type: Boolean, default: false },
   }, { timestamps: true }));
   async function notify(role, ids, title, body, kind, bookingId, eventKey) {
@@ -56,12 +56,12 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
       const messaging = require('firebase-admin/messaging').getMessaging();
       for (let i=0; i<targets.length; i+=500) { const batch=targets.slice(i,i+500); await messaging.sendEachForMulticast({ fids: batch.filter(t=>t.type==='fid').map(t=>t.value), tokens: batch.filter(t=>t.type==='token').map(t=>t.value),
         notification: { title, body }, data: { kind, bookingId: bookingId ? String(bookingId) : '' },
-        android: { priority: 'high', notification: { channelId: 'homefix_orders' } } }); }
+        android: { priority: 'high', notification: { channelId: 'homefix_updates_v5', defaultSound: true, defaultVibrateTimings: true } } }); }
     } catch (_) { /* The in-app inbox remains available if push is unavailable. */ }
   }
   const quietNotify = (...args) => notify(...args).catch(() => {});
   async function notifyBooking(booking) {
-    const workers = await Worker.find({ active: true, phoneVerified: true, verificationStatus: 'approved',
+    const workers = await Worker.find({ active: true, phoneVerified: true, hasProfilePhoto: true, verificationStatus: 'approved',
       payoutSummary: { $exists: true, $nin: [null,''] }, online: true, availableUntil: { $gt: new Date() }, approvedSkills: booking.service }).select('_id').lean();
     await Promise.all([
       quietNotify('admin',['admin'],'New service booking',`${booking.service} · ${booking.date} · ${booking.time}`,'new_booking',booking._id),
@@ -69,7 +69,13 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
     ]);
   }
   app.locals.notifyBooking = notifyBooking;
-  app.locals.notifyAssignment = booking => quietNotify('worker',[booking.assignedWorkerId],'A job was assigned to you',`${booking.service} · ${booking.date}. Open your assigned jobs.`,'assignment',booking._id);
+  app.locals.notifyAssignment = async booking => { await Promise.all([
+    quietNotify('worker',[booking.assignedWorkerId],'A job was assigned to you',`${booking.service} · ${booking.date}. Open your assigned jobs.`,'assignment',booking._id),
+    quietNotify('customer',[booking.customerUid],'Your worker is assigned','View your worker profile and visit details in HomeFix.','assignment',booking._id)]); await app.locals.sendServiceSms?.(booking,'assignment'); };
+  app.locals.notifyServiceEvent = async (booking,event) => { const labels={price_updated:'Service price updated',price_accepted:'Worker approved the service price',payment_received:'Payment received',completed:'Service completed'};
+    await Promise.all([quietNotify('customer',[booking.customerUid],labels[event]||'Order updated','Open HomeFix for your order details.',event,booking._id),booking.assignedWorkerId?quietNotify('worker',[booking.assignedWorkerId],labels[event]||'Order updated','Open HomeFix for your order details.',event,booking._id):Promise.resolve()]);
+    await app.locals.sendServiceSms?.(booking,event);
+  };
   function owner(req, role) { return role === 'admin' ? 'admin' : role === 'worker' ? String(req.worker._id) : req.customer.uid; }
   for (const [role, guard] of [['customer',requireCustomer],['worker',requireWorker],['admin',requireAdminKey]]) {
     app.post(`/api/${role}/devices`, guard, wrap(async(req,res)=>{
@@ -100,6 +106,11 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
       const tickets=await Ticket.find(filter).sort({updatedAt:-1}).skip((page-1)*20).limit(21).lean();
       res.json({tickets:tickets.slice(0,20),hasMore:tickets.length>20});
     }));
+    app.get(`/api/${role}/support/:id`,guard,wrap(async(req,res)=>{
+      if(!mongoose.isValidObjectId(req.params.id))return res.status(400).json({message:'Invalid conversation.'});
+      const ticket=await Ticket.findOne({_id:req.params.id,...(role==='admin'?{}:{ownerRole:role,ownerId:owner(req,role)})}).lean();
+      if(!ticket)return res.status(404).json({message:'Conversation not found.'});res.json({ticket});
+    }));
     app.get(`/api/${role}/support/:id/photo`,guard,wrap(async(req,res)=>{
       if(!mongoose.isValidObjectId(req.params.id))return res.status(400).json({message:'Invalid ticket.'});
       const ticket=await Ticket.findOne({_id:req.params.id,...(role==='admin'?{}:{ownerRole:role,ownerId:owner(req,role)})}).select('+photoEncrypted');
@@ -109,7 +120,7 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
     app.post(`/api/${role}/support/:id/reply`,guard,wrap(async(req,res)=>{
       const text=String(req.body?.message||'').trim();
       if(!mongoose.isValidObjectId(req.params.id)||!text||text.length>2000)return res.status(400).json({message:'Enter a reply up to 2,000 characters.'});
-      const ticket=await Ticket.findOneAndUpdate({_id:req.params.id,'messages.99':{$exists:false},...(role==='admin'?{}:{ownerRole:role,ownerId:owner(req,role)})},
+      const ticket=await Ticket.findOneAndUpdate({_id:req.params.id,'messages.499':{$exists:false},...(role==='admin'?{}:{ownerRole:role,ownerId:owner(req,role)})},
         {$push:{messages:{role,text,createdAt:new Date()}},$set:{status:role==='admin'&&req.body?.resolved===true?'resolved':'open'}},{new:true});
       if(!ticket)return res.status(409).json({message:'Ticket not found or conversation limit reached.'});
       if(role==='admin')await quietNotify(ticket.ownerRole,[ticket.ownerId],'HomeFix replied','Open Support to read the response.','support',ticket.bookingId);
@@ -127,7 +138,7 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
         const booking=await Booking.exists({_id:req.body.bookingId,...(role==='customer'?{customerUid:req.customer.uid}:{assignedWorkerId:req.worker._id})});
         if(!booking)return res.status(404).json({message:'Order not found.'});bookingId=req.body.bookingId;
       }
-      const ticket=await Ticket.create({...filter,bookingId,subject,messages:[{role,text:message,createdAt:new Date()}],
+      const ticket=await Ticket.create({...filter,ownerName:role==='worker'?req.worker.name:req.customer.name||'Customer',ownerPhone:role==='worker'?req.worker.phone:req.customer.phoneNumber,bookingId,subject,messages:[{role,text:message,createdAt:new Date()}],
         ...(photo?{photoEncrypted:encryptPrivate(photo,`ticket:${role}:${ownerId}`)}:{})});
       await quietNotify('admin',['admin'],'New support issue','A customer or worker has requested help.','support',bookingId);
       res.status(201).json({ticket:{_id:ticket._id,subject:ticket.subject,status:ticket.status,messages:ticket.messages,createdAt:ticket.createdAt}});
@@ -141,6 +152,7 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
     try{decoded=await customerFirebaseAuth.verifyIdToken(token||'');}catch(_){return res.status(401).json({message:'Verify your mobile number to sign in.'});}
     const phone=customerLocalPhone(decoded.phone_number);
     if(!phone)return res.status(403).json({message:'Verify an Indian mobile number with SMS first.'});
+    if(req.body?.termsVersion!==POLICY_VERSION)return res.status(400).json({message:'Update HomeFix Team and accept the current Terms and Privacy Policy.'});
     const existing=await Worker.findOne({phone});
     if(existing&&(!existing.active||(existing.firebaseUid&&existing.firebaseUid!==decoded.uid)))return res.status(403).json({message:'This account is disabled or linked to a different identity. Contact Admin.'});
     if(req.body?.resume===true&&(!existing||existing.firebaseUid!==decoded.uid||existing.termsVersion!==POLICY_VERSION))return res.status(409).json({message:'Sign in and accept the current terms before restoring this worker account.'});
@@ -170,12 +182,13 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
   }));
   app.patch('/api/worker/availability',requireWorker,wrap(async(req,res)=>{
     if(typeof req.body?.online!=='boolean')return res.status(400).json({message:'Choose online or offline.'});
-    if(req.body.online&&(!req.worker.phoneVerified||req.worker.verificationStatus!=='approved'||!req.worker.payoutSummary||!req.worker.approvedSkills?.length))return res.status(403).json({message:'Verify your mobile, identity, payout details and approved skills before going online.'});
+    if(req.body.online&&(!req.worker.hasProfilePhoto||!req.worker.phoneVerified||req.worker.verificationStatus!=='approved'||!req.worker.payoutSummary||!req.worker.approvedSkills?.length))return res.status(403).json({message:'Verify your mobile, identity, payout details and approved skills and your profile photo before going online.'});
     const worker=await Worker.findByIdAndUpdate(req.worker._id,{$set:{online:req.body.online,availableUntil:req.body.online?new Date(Date.now()+8*3600000):null,lastSeenAt:new Date()}},{new:true});
+    await app.locals.recordWorkerShift?.(worker,req.body.online);
     res.json({worker:publicWorker(worker)});
   }));
   app.get('/api/worker/offers',requireWorker,wrap(async(req,res)=>{
-    if(!req.worker.active||!req.worker.phoneVerified||req.worker.verificationStatus!=='approved'||!req.worker.payoutSummary||!req.worker.online||new Date(req.worker.availableUntil)<=new Date())return res.json({offers:[],online:false,worker:publicWorker(req.worker)});
+    if(!req.worker.active||!req.worker.hasProfilePhoto||!req.worker.phoneVerified||req.worker.verificationStatus!=='approved'||!req.worker.payoutSummary||!req.worker.online||new Date(req.worker.availableUntil)<=new Date())return res.json({offers:[],online:false,worker:publicWorker(req.worker)});
     const page=Math.max(1,Number.parseInt(req.query.page,10)||1);
     const bookings=await Booking.find({status:'pending',assignedWorkerId:null,service:{$in:req.worker.approvedSkills||[]},
       $or:[{scheduledAt:{$gt:new Date()}},{scheduledAt:null}]}).sort({createdAt:-1}).skip((page-1)*30).limit(31).lean();
@@ -191,6 +204,7 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
     if(!claimed)return res.status(409).json({message:'Another worker accepted this order, or Admin is assigning it. Refresh offers.'});
     await Promise.all([quietNotify('admin',['admin'],'Worker accepted an order',`${claimed.service} has been accepted.`,'claimed',claimed._id),
       quietNotify('customer',[claimed.customerUid],'Your worker is assigned',`Open your ${claimed.service} order for details.`,'assignment',claimed._id)]);
+    await app.locals.sendServiceSms?.(claimed,'assignment');
     res.json({bookingId:String(claimed._id),assigned:true});
   }));
   app.patch('/api/admin/bookings/:id/dispatch',requireAdminKey,wrap(async(req,res)=>{
@@ -206,7 +220,7 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
       const booking = await Booking.findOne({ _id: req.params.id, ...(role === 'customer' ? { customerUid: req.customer.uid } : role === 'worker' ? { assignedWorkerId: req.worker._id } : {}) }).lean();
       if (!booking) return res.status(404).json({ message: 'Order not found.' });
       const fields = ['service','date','time','scheduledAt','status','createdAt','completedAt','address','location','problem','customerName','phone','alternatePhone','assignedWorkerName',
-        'quotedAmountPaise','paymentMethod','paymentStatus','paymentUpdatedAt','paidAt','cashCollection','completionRequestedAt','completionVerifiedAt','workStartedAt','quoteAcceptedAt','review','dispatchMode'];
+        'quotedAmountPaise','paymentMethod','paymentStatus','paymentUpdatedAt','paidAt','cashCollection','completionRequestedAt','completionVerifiedAt','workStartedAt','quoteAcceptedAt','workerPriceAcceptedAt','commissionMode','commissionValue','review','dispatchMode'];
       const result = { bookingId: String(booking._id) };
       for (const field of fields) result[field] = booking[field] ?? null;
       if (role !== 'worker') { result.paymentReference = booking.razorpayPaymentId || null; result.paymentHistory = booking.paymentHistory || []; }
@@ -215,11 +229,11 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
     }));
   }
   app.post('/api/worker/bookings/:id/start',requireWorker,wrap(async(req,res)=>{
-    if(!req.worker.phoneVerified||req.worker.verificationStatus!=='approved'||!req.worker.payoutSummary)return res.status(403).json({message:'Verify your mobile, identity and payout details first.'});
+    if(!req.worker.hasProfilePhoto||!req.worker.phoneVerified||req.worker.verificationStatus!=='approved'||!req.worker.payoutSummary)return res.status(403).json({message:'Verify your mobile, identity and payout details first.'});
     if(!mongoose.isValidObjectId(req.params.id))return res.status(400).json({message:'Invalid order.'});
-    const booking=await Booking.findOneAndUpdate({_id:req.params.id,assignedWorkerId:req.worker._id,status:'accepted',workStartedAt:null,quoteAcceptedAt:{$ne:null}},{$set:{workStartedAt:new Date()}},{new:true});
-    if(!booking)return res.status(409).json({message:'Customer must accept the service quote before work starts.'});
-    await quietNotify('customer',[booking.customerUid],'Your service has started','Open your order for progress and payment details.','started',booking._id);res.json({started:true});
+    const booking=await Booking.findOneAndUpdate({_id:req.params.id,assignedWorkerId:req.worker._id,status:'accepted',workStartedAt:null,quoteAcceptedAt:{$ne:null},workerPriceAcceptedAt:{$ne:null},$expr:{$eq:['$workerAcceptedPricePaise','$quotedAmountPaise']}},{$set:{workStartedAt:new Date()},$inc:{__v:1}},{new:true});
+    if(!booking)return res.status(409).json({message:'Customer and worker must both approve the service price before work starts.'});
+    await quietNotify('customer',[booking.customerUid],'Your service has started','Open your order for progress and payment details.','started',booking._id);await app.locals.sendServiceSms?.(booking,'started');res.json({started:true});
   }));
   app.post('/api/customer/bookings/:id/quote-accept',requireCustomer,wrap(async(req,res)=>{
     if(!mongoose.isValidObjectId(req.params.id)||!Number.isSafeInteger(req.body?.amountPaise))return res.status(400).json({message:'Invalid order or quote.'});
@@ -228,7 +242,7 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
     if(!booking)return res.status(409).json({message:'Quote changed. Refresh your order before accepting.'});res.json({accepted:true});
   }));
   app.post('/api/worker/bookings/:id/evidence',requireWorker,wrap(async(req,res)=>{
-    if(!req.worker.phoneVerified||req.worker.verificationStatus!=='approved'||!req.worker.payoutSummary)return res.status(403).json({message:'Verify your mobile, identity and payout details first.'});
+    if(!req.worker.hasProfilePhoto||!req.worker.phoneVerified||req.worker.verificationStatus!=='approved'||!req.worker.payoutSummary)return res.status(403).json({message:'Verify your mobile, identity and payout details first.'});
     if(!mongoose.isValidObjectId(req.params.id)||!imagesValid(req.body?.images))return res.status(400).json({message:'Choose 1–3 JPEG/PNG result photos, each below 400 KB.'});
     const id=req.params.id;
     const booking=await Booking.findOneAndUpdate({_id:id,assignedWorkerId:req.worker._id,status:'accepted',workStartedAt:{$ne:null}},
@@ -257,10 +271,11 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
     if(!booking)return res.status(409).json({message:'Review the worker’s result first. A code can be renewed once per minute, up to five times per hour.'});
     // The quota window is anchored independently from the expiring OTP.
     if(!booking.completionOtpWindowAt||booking.completionOtpWindowAt<new Date(Date.now()-3600000))await Booking.updateOne({_id:id,completionOtpIssuedAt:now},{$set:{completionOtpWindowAt:now,completionOtpIssueCount:1}});
-    res.json({code,expiresAt:booking.completionOtpExpiresAt,message:'Show this to your assigned worker only after checking the finished service. It confirms completion, not payment.'});
+    const smsStatus=await app.locals.sendServiceSms?.(booking,'completion_code',{code,eventKey:String(+now)})||'not_configured';
+    res.json({code,smsStatus,expiresAt:booking.completionOtpExpiresAt,message:'Show this to your assigned worker only after checking the finished service. It confirms completion, not payment.'});
   }));
   app.post('/api/worker/bookings/:id/complete',requireWorker,wrap(async(req,res)=>{
-    if(!req.worker.phoneVerified||req.worker.verificationStatus!=='approved'||!req.worker.payoutSummary)return res.status(403).json({message:'Verify your mobile, identity and payout details first.'});
+    if(!req.worker.hasProfilePhoto||!req.worker.phoneVerified||req.worker.verificationStatus!=='approved'||!req.worker.payoutSummary)return res.status(403).json({message:'Verify your mobile, identity and payout details first.'});
     const id=req.params.id,code=String(req.body?.code||'');
     if(!mongoose.isValidObjectId(id)||!/^\d{6}$/.test(code))return res.status(400).json({message:'Enter the six-digit code from the customer’s app.'});
     const booking=await Booking.findOne({_id:id,assignedWorkerId:req.worker._id,status:'accepted'}).select('+completionOtpHash');
@@ -278,11 +293,13 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
     if(!done)return res.status(409).json({message:'Code was already used or the order changed. Refresh your jobs.'});
     await Promise.all([quietNotify('customer',[done.customerUid],'Service completion confirmed','Thank you. Review your service and check the payment receipt in your order.','completed',done._id),
       quietNotify('admin',['admin'],'Customer verified service completion',`${done.service} is complete.`,'completed',done._id)]);
+    await app.locals.autoSettle?.(done._id).catch(()=>{});
+    await app.locals.sendServiceSms?.(done,'completed');
     res.json({completed:true,completedAt:done.completedAt});
   }));
   app.post('/api/customer/bookings/:id/review',requireCustomer,wrap(async(req,res)=>{
-    const stars=req.body?.stars,comment=String(req.body?.comment||'').trim();
-    if(!mongoose.isValidObjectId(req.params.id)||!Number.isInteger(stars)||stars<1||stars>5||comment.length>1500)return res.status(400).json({message:'Choose 1–5 stars and a comment up to 1,500 characters.'});
+    const stars=req.body?.stars,workerStars=req.body?.workerStars??stars,comment=String(req.body?.comment||'').trim();
+    if(!mongoose.isValidObjectId(req.params.id)||!Number.isInteger(stars)||stars<1||stars>5||!Number.isInteger(workerStars)||workerStars<1||workerStars>5||comment.length>1500)return res.status(400).json({message:'Choose 1–5 stars and a comment up to 1,500 characters.'});
     const booking=await Booking.findOne({_id:req.params.id,customerUid:req.customer.uid,status:'completed',completionVerifiedAt:{$ne:null}});
     if(!booking)return res.status(409).json({message:'Only your customer-verified completed service can be reviewed.'});
     try{
@@ -291,12 +308,12 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
       let review;
       try { await session.withTransaction(async()=>{
         const claimed=await Booking.findOneAndUpdate({_id:booking._id,customerUid:req.customer.uid,status:'completed',review:null},
-          {$set:{review:{stars,comment,public:req.body?.public===true,createdAt:new Date()}}},{new:true,session});
+          {$set:{review:{stars,workerStars,comment,public:req.body?.public===true,createdAt:new Date()}}},{new:true,session});
         if(!claimed){const error=new Error('already reviewed');error.code=11000;throw error;}
-        [review]=await Review.create([{bookingId:booking._id,customerUid:req.customer.uid,service:booking.service,stars,comment,public:req.body?.public===true}],{session});
+        [review]=await Review.create([{bookingId:booking._id,customerUid:req.customer.uid,service:booking.service,workerId:booking.assignedWorkerId,workerStars,stars,comment,public:req.body?.public===true}],{session});
       }); } finally { await session.endSession(); }
       await quietNotify('admin',['admin'],'New service feedback',`A customer rated ${booking.service} ${stars}/5.`,'review',booking._id);
-      res.status(201).json({review:{stars,comment,public:review.public,createdAt:review.createdAt}});
+      res.status(201).json({review:{stars,workerStars,comment,public:review.public,createdAt:review.createdAt}});
     }catch(error){if(error.code===11000)return res.status(409).json({message:'This order already has a review.'});throw error;}
   }));
   app.get('/api/services/reviews',wrap(async(req,res)=>{
@@ -314,7 +331,7 @@ function registerServiceOperations({ app, mongoose, Booking, Worker, Customer, r
   app.get('/privacy',(_req,res)=>res.type('html').send(policyHtml('HomeFix privacy policy',PRIVACY)));
   app.locals.servicePolicyVersion=POLICY_VERSION;
 }
-const TERMS = `HomeFix connects customers with approved service workers. Select the correct service, a complete address or shared map pin, and your preferred date and time. Availability depends on worker acceptance or Admin assignment; a request is not a guaranteed arrival time.\n\nThe Admin quote and amount due are shown in your order. Accept the quote before work starts. Do not pay an undisclosed extra charge without contacting support. Online payments are confirmed only when verified by the payment provider; cash payments are shown separately.\n\nCheck the result photos and the finished work before sharing the one-time completion code. Sharing it confirms service completion, not cash payment or a waiver of your ability to raise an issue. Confirm cash only after actually paying it.\n\nWorkers must use their own verified mobile, submit identity and payout details, and work only in approved service categories. Going online makes matching order notifications available for an eight-hour shift; it does not guarantee work. Admin can assign or reassign orders. HomeFix commission normally starts at 20%, with the actual finalized commission shown per job. Withdrawals are reviewed and paid manually by Admin.\n\nContact support before cancelling an accepted visit or to request correction, cancellation or a refund. Admin reviews the particular order and payment; no automatic refund deadline or fee is promised by this app. Be accurate and respectful in photos, reviews and support messages. Do not upload someone else’s private information without permission.\n\nUse Call support, SMS support or the private support panel to reach HomeFix. These operational terms should be reviewed by the business owner before a wider public launch.`;
-const PRIVACY = `HomeFix uses verified mobile numbers, optional linked Google account details, profile information, service addresses, optional alternate numbers, booking schedules, order and payment records, and service reviews to operate bookings and support.\n\nLocation is requested only when you tap Use my current location. The selected coordinates and accuracy are saved with that order for service navigation. HomeFix does not collect continuous background customer location in this release. You can enter an address without sharing GPS.\n\nProblem photos and result photos are private to the customer, assigned worker and Admin. Identity documents and full payout details are encrypted and available only for the appropriate account or Admin review. Do not submit passwords, bank PINs or OTPs in support messages or documents.\n\nDevice notification registrations are used to send order and support alerts. Notification previews contain limited order information; open the signed-in app for private details. Matching workers see service and schedule information before claiming, with contact/address details available after assignment. Workers receive offers only for approved skills while online.\n\nPhone verification and optional Google sign-in use Firebase/Google. Notifications use Firebase Cloud Messaging. Choosing navigation opens Google Maps. Online payments use the configured Razorpay service. Opening SMS or a phone call hands control to your device’s messaging or phone app; a message is not sent automatically by HomeFix.\n\nReviews are shared publicly only if you choose the publish option, without your name, phone or address. Private feedback and support tickets are visible to you and Admin. Order records and private documents are kept in the business database; contact support for access, correction or deletion requests and any records that must be retained for payment or dispute handling. Admin can remove reviewed ID images while keeping the review decision.\n\nContact HomeFix through the in-app support panel. This policy describes the implemented app behavior and is not a claim of regulatory certification.`;
+const TERMS = `HomeFix connects customers with approved service workers. Select the correct service, a complete address or shared map pin, and your preferred date and time. Availability depends on worker acceptance or Admin assignment; a request is not a guaranteed arrival time.\n\nThe Admin service price and amount due are shown in your order. Accept the service price before work starts. Do not pay an undisclosed extra charge without contacting support. Online payments are confirmed only when verified by the payment provider; cash payments are shown separately.\n\nCheck the result photos and the finished work before sharing the one-time completion code. Sharing it confirms service completion, not cash payment or a waiver of your ability to raise an issue. Confirm cash only after actually paying it.\n\nWorkers must use their own verified mobile, submit identity and payout details, and work only in approved service categories. A profile photo is required before going online. Availability shifts, app heartbeats and service start/completion timestamps are recorded for worker and Admin activity summaries. These are availability and recorded job duration, not proof of continuous physical work. Going online makes matching order notifications available for an eight-hour shift; it does not guarantee work. Admin can assign or reassign orders. HomeFix commission normally starts at 20%. The worker sees and approves the service price and commission before starting work. Completed, customer-verified and paid jobs are credited automatically once, with commission deducted in the wallet. Cash held by workers offsets their balance; commission owed is shown separately. Withdrawals are reviewed and paid manually by Admin.\n\nContact support before cancelling an accepted visit or to request correction, cancellation or a refund. Admin reviews the particular order and payment; no automatic refund deadline or fee is promised by this app. Be accurate and respectful in photos, reviews and support messages. Do not upload someone else’s private information without permission.\n\nUse Call support, SMS support or the private support panel to reach HomeFix. These operational terms should be reviewed by the business owner before a wider public launch.`;
+const PRIVACY = `HomeFix uses verified mobile numbers, optional linked Google account details, profile information, worker profile photos and approved skills, worker availability shifts and app heartbeats, recorded service duration, service addresses, optional alternate numbers, booking schedules, order and payment records, and service reviews to operate bookings and support.\n\nLocation is requested only when you tap Use my current location. The selected coordinates and accuracy are saved with that order for service navigation. HomeFix does not collect continuous background customer location in this release. You can enter an address without sharing GPS.\n\nProblem photos and result photos are private to the customer, assigned worker and Admin. Identity documents and full payout details are encrypted and available only for the appropriate account or Admin review. Do not submit passwords, bank PINs or OTPs in support messages or documents.\n\nDevice notification registrations are used to send order and support alerts. Notification previews contain limited order information; open the signed-in app for private details. Matching workers see service and schedule information before claiming, with contact/address details available after assignment. Workers receive offers only for approved skills while online.\n\nPhone verification and optional Google sign-in use Firebase/Google. Notifications use Firebase Cloud Messaging. Choosing navigation opens Google Maps. Online payments use the configured Razorpay service. Support messages stay in the in-app chat and are visible to the account owner and Admin. A phone call opens the device dialer. Optional service SMS updates require customer opt-in and an active configured SMS provider; completion-code SMS goes only to the verified customer number. A code is never included in public notification previews.\n\nIndividual reviews and comments are shared publicly only if you choose the publish option, without your name, phone or address. Worker star scores contribute to aggregate ratings shown to workers, Admin and their assigned customers; private comments are not included in those profiles. Private feedback and support tickets are visible to you and Admin. Order records and private documents are kept in the business database; contact support for access, correction or deletion requests and any records that must be retained for payment or dispute handling. Admin can remove reviewed ID images while keeping the review decision.\n\nContact HomeFix through the in-app support panel. This policy describes the implemented app behavior and is not a claim of regulatory certification.`;
 function policyHtml(title,text){return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head><body style="font:16px/1.7 system-ui;max-width:760px;margin:40px auto;padding:20px;color:#153e3a"><h1>${title}</h1>${text.split('\n\n').map(p=>`<p>${p}</p>`).join('')}<p>Version ${POLICY_VERSION}</p></body></html>`;}
 module.exports={registerServiceOperations,SERVICES,POLICY_VERSION,validPin,eligible,completionHash,safeOffer,imagesValid};

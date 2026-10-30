@@ -28,7 +28,7 @@ async function hashPassword(password, salt) {
 }
 function publicWorker(worker) {
   return { id: String(worker._id), name: worker.name, phone: worker.phone, active: worker.active,
-    phoneVerified: worker.phoneVerified === true, skills: worker.skills || [], approvedSkills: worker.approvedSkills || [],
+    hasProfilePhoto: worker.hasProfilePhoto === true, phoneVerified: worker.phoneVerified === true, skills: worker.skills || [], approvedSkills: worker.approvedSkills || [],
     online: worker.online === true && new Date(worker.availableUntil) > new Date(), availableUntil: worker.availableUntil || null, lastSeenAt: worker.lastSeenAt || null,
     verificationStatus: worker.verificationStatus || 'not_submitted', identityType: worker.identityType || null,
     identityLast4: worker.identityLast4 || null, reviewNote: worker.reviewNote || '',
@@ -60,6 +60,7 @@ function registerTeamHistory({ app, mongoose, Booking, Customer, customerFirebas
     salt: { type: String, required: true, select: false },
     active: { type: Boolean, default: true },
     sessionVersion: { type: Number, default: 0 },
+    profilePhotoData: { type: String, select: false }, hasProfilePhoto: { type: Boolean, default: false },
     firebaseUid: { type: String, unique: true, sparse: true }, phoneVerified: { type: Boolean, default: false },
     skills: { type: [String], default: [] }, approvedSkills: { type: [String], default: [] },
     online: { type: Boolean, default: false }, availableUntil: Date, lastSeenAt: Date, termsAcceptedAt: Date, termsVersion: String,
@@ -157,13 +158,13 @@ function registerTeamHistory({ app, mongoose, Booking, Customer, customerFirebas
     }
     const original = await Booking.findById(req.params.id);
     if (!original) return res.status(404).json({ message: 'Order not found.' });
-    const worker = workerId === null ? null : await Worker.findOne({ _id: workerId, active: true, phoneVerified: true, verificationStatus: 'approved', payoutSummary: { $exists: true, $nin: [null, ''] }, approvedSkills: original.service });
+    const worker = workerId === null ? null : await Worker.findOne({ _id: workerId, active: true, phoneVerified: true, hasProfilePhoto: true, verificationStatus: 'approved', payoutSummary: { $exists: true, $nin: [null, ''] }, approvedSkills: original.service });
     if (workerId !== null && !worker) return res.status(404).json({ message: 'Worker must be active and identity-approved before assignment.' });
     const booking = await Booking.findOneAndUpdate({ _id: req.params.id,
       status: { $nin: ['completed', 'cancelled'] } }, { $set: {
         assignedWorkerId: worker?._id || null, assignedWorkerName: worker?.name || null,
-        assignedAt: worker ? new Date() : null, cashCollection: null, workStartedAt: null, completionPhotosEncrypted: null, completionPhotoWorkerId: null, completionRequestedAt: null, completionOtpHash: null, completionOtpExpiresAt: null,
-      } }, { new: true, runValidators: true });
+        assignedAt: worker ? new Date() : null, cashCollection: null, workStartedAt: null, workerPriceAcceptedAt: null, workerAcceptedPricePaise: null, completionPhotosEncrypted: null, completionPhotoWorkerId: null, completionRequestedAt: null, completionOtpHash: null, completionOtpExpiresAt: null,
+      }, $inc: { __v: 1 } }, { new: true, runValidators: true });
     if (!booking) return res.status(409).json({ message: 'Booking not found or already closed.' });
     if (booking.assignedWorkerId && app.locals.notifyAssignment) await app.locals.notifyAssignment(booking);
     res.json({ bookingId: String(booking._id), assignedWorkerId: booking.assignedWorkerId,
@@ -223,10 +224,13 @@ function registerTeamHistory({ app, mongoose, Booking, Customer, customerFirebas
       $expr: { $eq: ['$assignedWorkerId', '$cashCollection.workerId'] } },
       { $set: { paymentStatus: 'paid', paidAt: now, paymentUpdatedAt: now,
         'cashCollection.status': 'customer_confirmed', 'cashCollection.confirmedAt': now },
+        $inc: { __v: 1 },
         $push: { paymentHistory: { status: 'paid', method: 'cash_on_service',
           amountPaise: req.body.amountPaise, recordedAt: now } } },
       { new: true, runValidators: true });
     if (!booking) return res.status(409).json({ message: 'Payment changed or no cash confirmation is awaiting you. Refresh history.' });
+    await app.locals.autoSettle?.(booking._id).catch(() => {});
+    await app.locals.notifyServiceEvent?.(booking, 'payment_received');
     res.json({ message: 'Cash payment confirmed.', booking: historyBooking(booking) });
   }));
 

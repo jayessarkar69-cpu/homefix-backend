@@ -38,7 +38,7 @@ function routesFixture({worker={_id:'123456789012345678901234',verificationStatu
  const Withdrawal={async init(){},async create(records){calls.push(['withdrawalCreate',records]);return[{_id:'withdrawal-test',...records[0]}];},
   findOneAndUpdate(filter,update){calls.push(['withdrawalUpdate',filter,update]);return chain(withdrawal);}};
  const app={};for(const method of ['get','post','patch','delete'])app[method]=(path,...handlers)=>routes.set(method+' '+path,handlers);
- const mongoose={Schema:class{static Types={ObjectId:String,Mixed:Object};},models:{BusinessSettings:{},WorkerWithdrawal:Withdrawal,WorkerSettlement:{async init(){}},WorkerRemittance:{async init(){}}},
+ const mongoose={Schema:class{static Types={ObjectId:String,Mixed:Object};},models:{WorkerShift:{},ServiceSmsDelivery:{},BusinessSettings:{},WorkerWithdrawal:Withdrawal,WorkerSettlement:{async init(){}},WorkerRemittance:{async init(){}}},
   async startSession(){return{async withTransaction(fn){return fn();},async endSession(){}};},isValidObjectId:v=>/^[a-f0-9]{24}$/.test(v||'')};
  const guard=(req,res,next)=>req.authorized?next():res.status(401).json({message:'Unauthorized'});
  const wrap=fn=>async(req,res,next)=>{try{await fn(req,res,next);}catch(_){res.status(500).json({message:'Internal error'});}};

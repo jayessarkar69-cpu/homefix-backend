@@ -30,7 +30,7 @@ function query(value){let fields;const q={select(f){fields=f;return this;},sort(
  return q;
 }
 function fixture(overrides={}){
- const worker={_id:w1,name:'Worker A',active:true,phone:'9999999999',phoneVerified:true,verificationStatus:'approved',payoutSummary:'UPI masked',online:true,availableUntil:new Date(Date.now()+3600000),approvedSkills:['Plumbing'],...overrides.worker};
+ const worker={_id:w1,name:'Worker A',active:true,hasProfilePhoto:true,phone:'9999999999',phoneVerified:true,verificationStatus:'approved',payoutSummary:'UPI masked',online:true,availableUntil:new Date(Date.now()+3600000),approvedSkills:['Plumbing'],...overrides.worker};
  const state={booking:{_id:bid,customerUid:'customer-a',customerName:'Private Customer',phone:'9999999999',address:'Private address',service:'Plumbing',date:'2026-11-01',time:'10 AM',status:'accepted',assignedWorkerId:w1,
   quotedAmountPaise:50000,paymentMethod:'cash_on_service',paymentStatus:'pending_collection',workStartedAt:new Date(),quoteAcceptedAt:new Date(),
   completionRequestedAt:new Date(),completionPhotoWorkerId:w1,completionOtpAttempts:0,completionOtpIssueCount:0,review:null,
@@ -67,7 +67,7 @@ test('location pins reject malformed and out-of-range coordinates',()=>{
 });
 test('matching requires approved category, phone, identity, payout and active online shift',()=>{
  const f=fixture();assert.equal(eligible(f.worker,'Plumbing'),true);assert.equal(eligible(f.worker,'AC Repair'),false);
- for(const patch of [{active:false},{phoneVerified:false},{verificationStatus:'pending'},{payoutSummary:null},{online:false},{availableUntil:new Date(0)}])assert.equal(eligible({...f.worker,...patch},'Plumbing'),false);
+ for(const patch of [{active:false},{hasProfilePhoto:false},{phoneVerified:false},{verificationStatus:'pending'},{payoutSummary:null},{online:false},{availableUntil:new Date(0)}])assert.equal(eligible({...f.worker,...patch},'Plumbing'),false);
 });
 test('unassigned offers do not reveal customer contact, address, pin or photos',()=>{
  const offer=safeOffer(fixture().state.booking);
@@ -151,7 +151,7 @@ test('booking creation stores the authenticated owner, canonical IST schedule an
   payload=null;return new Promise((resolve,reject)=>{const res={code:200,status(c){this.code=c;return this;},json(data){resolve({code:this.code,data});}};
    Promise.resolve(handler({body,customer:{uid:'customer-a',phoneNumber:phone}},res)).catch(reject);});
  }
- const scheduledAt=new Date(Date.now()+86400000).toISOString();const base={customerName:'Test Customer',phone:'9999999999',address:'Test address',service:'Plumbing',date:'untrusted date',time:'untrusted time',scheduledAt,termsVersion:'2026-10-30-v4',clientFeatureVersion:4,customerUid:'attacker',paymentStatus:'paid',quotedAmountPaise:1};
+ const scheduledAt=new Date(Date.now()+86400000).toISOString();const base={customerName:'Test Customer',phone:'9999999999',address:'Test address',service:'Plumbing',date:'untrusted date',time:'untrusted time',scheduledAt,termsVersion:'2026-10-30-v5',clientFeatureVersion:4,customerUid:'attacker',paymentStatus:'paid',quotedAmountPaise:1};
  assert.equal((await request({...base,location:{latitude:23.83,longitude:91.28}})).code,201);
  assert.equal(payload.customerUid,'customer-a');assert.equal(payload.paymentStatus,undefined);assert.equal(payload.quotedAmountPaise,undefined);assert.equal(payload.dispatchMode,'first_claim');
  const ist=new Date(new Date(scheduledAt).getTime()+330*60000);assert.equal(payload.date,ist.toISOString().slice(0,10));assert.match(payload.time,/^\d{2}:\d{2} IST$/);assert.equal(alerts,1);
