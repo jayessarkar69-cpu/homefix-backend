@@ -3,8 +3,8 @@ const crypto = require('crypto');
 const { promisify } = require('util');
 const scrypt = promisify(crypto.scrypt);
 
-function signWorkerToken(worker, secret) {
-  const payload = Buffer.from(JSON.stringify({ role: 'worker', sub: String(worker._id),
+function signWorkerToken(worker, secret, authMethod = 'verified_mobile') {
+  const payload = Buffer.from(JSON.stringify({ role: 'worker', authMethod, sub: String(worker._id),
     version: worker.sessionVersion, exp: Math.floor(Date.now() / 1000) + 28800 })).toString('base64url');
   return `${payload}.${crypto.createHmac('sha256', secret).update(payload).digest('base64url')}`;
 }
@@ -28,6 +28,8 @@ async function hashPassword(password, salt) {
 }
 function publicWorker(worker) {
   return { id: String(worker._id), name: worker.name, phone: worker.phone, active: worker.active,
+    phoneVerified: worker.phoneVerified === true, skills: worker.skills || [], approvedSkills: worker.approvedSkills || [],
+    online: worker.online === true && new Date(worker.availableUntil) > new Date(), availableUntil: worker.availableUntil || null, lastSeenAt: worker.lastSeenAt || null,
     verificationStatus: worker.verificationStatus || 'not_submitted', identityType: worker.identityType || null,
     identityLast4: worker.identityLast4 || null, reviewNote: worker.reviewNote || '',
     identitySubmittedAt: worker.identitySubmittedAt || null, identityReviewedAt: worker.identityReviewedAt || null,
@@ -35,7 +37,11 @@ function publicWorker(worker) {
   };
 }
 function historyBooking(b) {
-  return { bookingId: String(b._id), service: b.service, date: b.date, time: b.time,
+  return { location: b.location || null, scheduledAt: b.scheduledAt || null, dispatchMode: b.dispatchMode || 'admin_assign',
+    completionRequestedAt: b.completionRequestedAt || null, completionVerifiedAt: b.completionVerifiedAt || null,
+    quoteAcceptedAt: b.quoteAcceptedAt || null, workStartedAt: b.workStartedAt || null, review: b.review || null,
+    problem: b.problem || '',
+    bookingId: String(b._id), service: b.service, date: b.date, time: b.time,
     address: b.address, status: b.status, createdAt: b.createdAt,
     completedAt: b.completedAt || null, quotedAmountPaise: b.quotedAmountPaise,
     paymentMethod: b.paymentMethod, paymentStatus: b.paymentStatus,
@@ -46,7 +52,7 @@ function historyBooking(b) {
     cashCollection: b.cashCollection || null, alternatePhone: b.alternatePhone || null };
 }
 
-function registerTeamHistory({ app, mongoose, Booking, Customer, requireAdminKey, requireCustomer, customerLocalPhone }) {
+function registerTeamHistory({ app, mongoose, Booking, Customer, customerFirebaseAuth, requireAdminKey, requireCustomer, customerLocalPhone }) {
   const workerSchema = new mongoose.Schema({
     name: { type: String, required: true, maxlength: 100 },
     phone: { type: String, required: true, unique: true },
@@ -54,6 +60,9 @@ function registerTeamHistory({ app, mongoose, Booking, Customer, requireAdminKey
     salt: { type: String, required: true, select: false },
     active: { type: Boolean, default: true },
     sessionVersion: { type: Number, default: 0 },
+    firebaseUid: { type: String, unique: true, sparse: true }, phoneVerified: { type: Boolean, default: false },
+    skills: { type: [String], default: [] }, approvedSkills: { type: [String], default: [] },
+    online: { type: Boolean, default: false }, availableUntil: Date, lastSeenAt: Date, termsAcceptedAt: Date, termsVersion: String,
     verificationStatus: { type: String, enum: ['not_submitted','pending','approved','rejected'], default: 'not_submitted' },
     identityEncrypted: { type: mongoose.Schema.Types.Mixed, select: false },
     payoutEncrypted: { type: mongoose.Schema.Types.Mixed, select: false },
@@ -87,7 +96,7 @@ function registerTeamHistory({ app, mongoose, Booking, Customer, requireAdminKey
   const requireWorker = wrap(async (req, res, next) => {
     const match = (req.get('authorization') || '').match(/^Bearer\s+(.+)$/i);
     const payload = verifyWorkerToken(match?.[1], process.env.ADMIN_SESSION_SECRET);
-    if (!payload || !mongoose.isValidObjectId(payload.sub)) {
+    if (!payload || payload.authMethod !== 'verified_mobile' || !mongoose.isValidObjectId(payload.sub)) {
       return res.status(401).json({ message: 'Please sign in again.' });
     }
     const worker = await Worker.findOne({ _id: payload.sub, active: true,
@@ -98,24 +107,7 @@ function registerTeamHistory({ app, mongoose, Booking, Customer, requireAdminKey
   });
 
   app.post('/api/worker/login', wrap(async (req, res) => {
-    if (!process.env.ADMIN_SESSION_SECRET) return res.status(503).json({ message: 'Worker login is not configured.' });
-    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
-    if (!limit(ip)) return res.status(429).json({ message: 'Too many attempts. Try again in 15 minutes.' });
-    const phone = String(req.body?.phone || '').trim();
-    const password = req.body?.password;
-    if (!/^\d{10}$/.test(phone) || typeof password !== 'string' || password.length > 128) {
-      return res.status(401).json({ message: 'Invalid phone or password.' });
-    }
-    const worker = await Worker.findOne({ phone, active: true }).select('+passwordHash +salt');
-    const salt = worker?.salt || 'invalid-worker-salt';
-    const candidate = await hashPassword(password, salt);
-    const expected = worker?.passwordHash || '0'.repeat(128);
-    if (!crypto.timingSafeEqual(Buffer.from(candidate), Buffer.from(expected))) {
-      return res.status(401).json({ message: 'Invalid phone or password.' });
-    }
-    failures.delete(ip);
-    return res.json({ token: signWorkerToken(worker, process.env.ADMIN_SESSION_SECRET),
-      worker: publicWorker(worker), expiresIn: 28800 });
+    return res.status(426).json({ message: 'Update HomeFix Team and sign in with your verified mobile OTP. Your existing account and history are linked by the same phone number.' });
   }));
 
   app.get('/api/admin/workers', requireAdminKey, wrap(async (_req, res) => {
@@ -125,7 +117,7 @@ function registerTeamHistory({ app, mongoose, Booking, Customer, requireAdminKey
   app.post('/api/admin/workers', requireAdminKey, wrap(async (req, res) => {
     const name = String(req.body?.name || '').trim();
     const phone = String(req.body?.phone || '').trim();
-    const password = req.body?.password;
+    const password = typeof req.body?.password === 'string' && req.body.password.length ? req.body.password : crypto.randomBytes(32).toString('hex');
     if (!name || name.length > 100 || !/^\d{10}$/.test(phone) ||
         typeof password !== 'string' || password.length < 10 || password.length > 128) {
       return res.status(400).json({ message: 'Enter a name, 10-digit phone, and password of 10–128 characters.' });
@@ -163,29 +155,33 @@ function registerTeamHistory({ app, mongoose, Booking, Customer, requireAdminKey
         (workerId !== null && !mongoose.isValidObjectId(workerId))) {
       return res.status(400).json({ message: 'Invalid booking or worker ID.' });
     }
-    const worker = workerId === null ? null : await Worker.findOne({ _id: workerId, active: true, verificationStatus: 'approved', payoutSummary: { $exists: true, $nin: [null, ''] } });
+    const original = await Booking.findById(req.params.id);
+    if (!original) return res.status(404).json({ message: 'Order not found.' });
+    const worker = workerId === null ? null : await Worker.findOne({ _id: workerId, active: true, phoneVerified: true, verificationStatus: 'approved', payoutSummary: { $exists: true, $nin: [null, ''] }, approvedSkills: original.service });
     if (workerId !== null && !worker) return res.status(404).json({ message: 'Worker must be active and identity-approved before assignment.' });
     const booking = await Booking.findOneAndUpdate({ _id: req.params.id,
       status: { $nin: ['completed', 'cancelled'] } }, { $set: {
         assignedWorkerId: worker?._id || null, assignedWorkerName: worker?.name || null,
-        assignedAt: worker ? new Date() : null, cashCollection: null,
+        assignedAt: worker ? new Date() : null, cashCollection: null, workStartedAt: null, completionPhotosEncrypted: null, completionPhotoWorkerId: null, completionRequestedAt: null, completionOtpHash: null, completionOtpExpiresAt: null,
       } }, { new: true, runValidators: true });
     if (!booking) return res.status(409).json({ message: 'Booking not found or already closed.' });
+    if (booking.assignedWorkerId && app.locals.notifyAssignment) await app.locals.notifyAssignment(booking);
     res.json({ bookingId: String(booking._id), assignedWorkerId: booking.assignedWorkerId,
       assignedWorkerName: booking.assignedWorkerName });
   }));
   app.get('/api/worker/bookings', requireWorker, wrap(async (req, res) => {
-    if ((req.worker.verificationStatus !== 'approved' || !req.worker.payoutSummary)) return res.json({ worker: publicWorker(req.worker), bookings: [], hasMore: false, needsVerification: true });
+    if ((!req.worker.phoneVerified || req.worker.verificationStatus !== 'approved' || !req.worker.payoutSummary)) return res.json({ worker: publicWorker(req.worker), bookings: [], hasMore: false, needsVerification: true });
     const limit = 50;
     const page = Math.max(1, Math.min(10000, Number.parseInt(req.query.page, 10) || 1));
     const bookings = await Booking.find({ assignedWorkerId: req.worker._id, status: { $ne: 'cancelled' } })
-      .select('customerName phone alternatePhone address service date time status completedAt assignedAt quotedAmountPaise paymentMethod paymentStatus cashCollection')
+      .select('customerName phone alternatePhone address location problem service date time scheduledAt status completedAt assignedAt quotedAmountPaise paymentMethod paymentStatus cashCollection completionRequestedAt completionVerifiedAt quoteAcceptedAt workStartedAt review')
       .sort({ assignedAt: -1 }).skip((page - 1) * limit).limit(limit + 1).lean();
     res.json({ worker: publicWorker(req.worker), bookings: bookings.slice(0, limit), hasMore: bookings.length > limit });
   }));
   app.patch('/api/worker/bookings/:id/status', requireWorker, wrap(async (req, res) => {
-    if ((req.worker.verificationStatus !== 'approved' || !req.worker.payoutSummary)) return res.status(403).json({ message: 'Identity approval and payout details are required before working on jobs.' });
+    if ((!req.worker.phoneVerified || req.worker.verificationStatus !== 'approved' || !req.worker.payoutSummary)) return res.status(403).json({ message: 'Identity approval and payout details are required before working on jobs.' });
     const status = req.body?.status;
+    if (status === 'completed') return res.status(409).json({ message: 'Upload result photos and verify the customer completion code to finish this service.' });
     if (!mongoose.isValidObjectId(req.params.id) || !['accepted', 'completed'].includes(status)) {
       return res.status(400).json({ message: 'Choose accepted or completed.' });
     }
@@ -200,7 +196,7 @@ function registerTeamHistory({ app, mongoose, Booking, Customer, requireAdminKey
 
   // Workers can request a cash receipt; only the authenticated customer can confirm it.
   app.post('/api/worker/bookings/:id/cash-request', requireWorker, wrap(async (req, res) => {
-    if ((req.worker.verificationStatus !== 'approved' || !req.worker.payoutSummary)) return res.status(403).json({ message: 'Identity approval and payout details are required.' });
+    if ((!req.worker.phoneVerified || req.worker.verificationStatus !== 'approved' || !req.worker.payoutSummary)) return res.status(403).json({ message: 'Identity approval and payout details are required.' });
     if (!mongoose.isValidObjectId(req.params.id) || !Number.isSafeInteger(req.body?.amountPaise) || req.body.amountPaise <= 0) {
       return res.status(400).json({ message: 'Invalid booking or amount.' });
     }
@@ -234,6 +230,11 @@ function registerTeamHistory({ app, mongoose, Booking, Customer, requireAdminKey
     res.json({ message: 'Cash payment confirmed.', booking: historyBooking(booking) });
   }));
 
+  require('./service-operations').registerServiceOperations({
+    app, mongoose, Booking, Worker, Customer, requireWorker, requireCustomer, requireAdminKey, wrap,
+    customerFirebaseAuth, customerLocalPhone, signWorkerToken, hashPassword, publicWorker, limit,
+  });
+
   require('./business-tools').registerBusinessTools({
     app, mongoose, Booking, Worker, Customer, requireAdminKey, requireCustomer,
     requireWorker, wrap, hashPassword, publicWorker, limit,
@@ -246,10 +247,19 @@ function registerTeamHistory({ app, mongoose, Booking, Customer, requireAdminKey
         { $set: { customerUid: req.customer.uid } });
     }
     const owner = { customerUid: req.customer.uid };
+    const filter = { ...owner };
+    const category = String(req.query.service || '');
+    if (category) {
+      if (!require('./service-operations').SERVICES.includes(category)) return res.status(400).json({ message: 'Choose a valid service category.' });
+      filter.service = category;
+    }
+    if (req.query.status === 'active') filter.status = { $in: ['pending','accepted'] };
+    else if (req.query.status === 'completed') filter.status = 'completed';
+    else if (req.query.status === 'cancelled') filter.status = 'cancelled';
     const page = Math.max(1, Math.min(10000, Number.parseInt(req.query.page, 10) || 1));
     const limit = 20;
     const [bookings, totals] = await Promise.all([
-      Booking.find(owner).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit + 1).lean(),
+      Booking.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit + 1).lean(),
       Booking.aggregate([{ $match: owner }, { $group: { _id: null, totalOrders: { $sum: 1 },
         completedServices: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
         totalPaidPaise: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'paid'] }, { $ifNull: ['$quotedAmountPaise', 0] }, 0] } },

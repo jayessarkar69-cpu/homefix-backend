@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test business-tools.test.js team-history.test.js service-operations.test.js",
     "start": "node server.js"
   },
   "keywords": [],

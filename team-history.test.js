@@ -28,7 +28,7 @@ test('passwords use salted hashes', async () => {
   assert.notEqual(a, await hashPassword('test-password-123', 'salt-b'));
 });
 
-function fixture({ worker = { _id: wid, name: 'Worker A', active: true, sessionVersion: 0, verificationStatus: 'approved', payoutSummary: 'UPI test' }, bookings = [] } = {}) {
+function fixture({ worker = { _id: wid, name: 'Worker A', active: true, sessionVersion: 0, verificationStatus: 'approved', payoutSummary: 'UPI test', phoneVerified: true, approvedSkills: ['Plumbing'] }, bookings = [] } = {}) {
   process.env.ADMIN_SESSION_SECRET = secret;
   const routes = new Map();
   const calls = [];
@@ -44,9 +44,9 @@ function fixture({ worker = { _id: wid, name: 'Worker A', active: true, sessionV
     async aggregate(pipeline) { calls.push(['aggregate', pipeline]); return []; },
     async findOneAndUpdate(filter, update) { calls.push(['update', filter, update]); return null; },
   };
-  const app = {};
+  const app = { locals: {} };
   for (const method of ['get', 'post', 'patch', 'delete']) app[method] = (path, ...handlers) => routes.set(`${method} ${path}`, handlers);
-  registerTeamHistory({ app, mongoose: { models: { Worker }, Schema: class { static Types = { Mixed: Object, ObjectId: String }; }, model: () => ({}), isValidObjectId: value => /^[a-f0-9]{24}$/.test(value || '') },
+  registerTeamHistory({ app, mongoose: { models: { Worker }, Schema: class { static Types = { Mixed: Object, ObjectId: String }; index() {} }, model: () => ({ schema: { index() {} } }), isValidObjectId: value => /^[a-f0-9]{24}$/.test(value || '') },
     Booking, requireAdminKey: (req, res, next) => req.admin ? next() : res.status(401).json({ message: 'Unauthorized' }),
     requireCustomer: (req, res, next) => req.customer ? next() : res.status(401).json({ message: 'Unauthorized' }),
     customerLocalPhone: phone => phone?.replace('+91', '') });
@@ -90,10 +90,11 @@ test('worker job updates require ownership and valid transition', async () => {
   const f = fixture();
   assert.equal((await f.run('patch', '/api/worker/bookings/:id/status', { ...f.auth, body: { status: 'cancelled' } })).code, 400);
   assert.equal((await f.run('patch', '/api/worker/bookings/:id/status', { ...f.auth, body: { status: 'completed' } })).code, 409);
+  assert.equal(f.calls.some(c => c[0] === 'update'), false);
+  await f.run('patch', '/api/worker/bookings/:id/status', { ...f.auth, body: { status: 'accepted' } });
   const update = f.calls.find(c => c[0] === 'update');
   assert.equal(update[1].assignedWorkerId, wid);
-  assert.deepEqual(update[1].status, { $in: ['accepted'] });
-  assert.ok(update[2].$set.completedAt instanceof Date);
+  assert.deepEqual(update[1].status, { $in: ['pending'] });
 });
 test('worker cash request never marks a payment paid', async () => {
   const f = fixture();
@@ -172,4 +173,19 @@ test('real admin verifier refuses a correctly signed worker token', () => {
     crypto, Buffer, process: { env: { ADMIN_SESSION_SECRET: secret } },
   });
   assert.equal(verifyAdmin(signWorkerToken({ _id: wid, sessionVersion: 0 }, secret)), false);
+});
+
+test('identity approval and payout details are required before job access', async () => {
+  for (const worker of [
+    { _id: wid, active: true, sessionVersion: 0, verificationStatus: 'pending', payoutSummary: 'UPI test' },
+    { _id: wid, active: true, sessionVersion: 0, verificationStatus: 'approved' },
+  ]) {
+    const f = fixture({ worker });
+    const jobs = await f.run('get', '/api/worker/bookings', f.auth);
+    assert.equal(jobs.data.needsVerification, true);
+    assert.deepEqual(jobs.data.bookings, []);
+    assert.equal(f.calls.some(c => c[0] === 'find'), false);
+    assert.equal((await f.run('patch', '/api/worker/bookings/:id/status', { ...f.auth, body: { status: 'accepted' } })).code, 403);
+    assert.equal((await f.run('post', '/api/worker/bookings/:id/cash-request', { ...f.auth, body: { amountPaise: 49900 } })).code, 403);
+  }
 });

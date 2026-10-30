@@ -55,6 +55,19 @@ const bookingSchema = new mongoose.Schema(
       default: '',
       trim: true,
     },
+    location: { latitude: Number, longitude: Number, accuracy: Number, capturedAt: Date },
+    scheduledAt: { type: Date, default: null },
+    dispatchMode: { type: String, enum: ['first_claim','admin_assign'], default: 'first_claim' },
+    problemPhotosEncrypted: { type: mongoose.Schema.Types.Mixed, select: false },
+    completionPhotosEncrypted: { type: mongoose.Schema.Types.Mixed, select: false },
+    completionPhotoWorkerId: mongoose.Schema.Types.ObjectId,
+    completionRequestedAt: { type: Date, default: null }, completionVerifiedAt: { type: Date, default: null },
+    completionOtpHash: { type: String, select: false }, completionOtpExpiresAt: Date,
+    completionOtpIssuedAt: Date, completionOtpWindowAt: Date,
+    completionOtpIssueCount: { type: Number, default: 0 }, completionOtpAttempts: { type: Number, default: 0 },
+    workStartedAt: { type: Date, default: null }, quoteAcceptedAt: { type: Date, default: null }, acceptedQuotePaise: Number,
+    review: { type: new mongoose.Schema({ stars: Number, comment: String, public: Boolean, createdAt: Date }, { _id: false }), default: null },
+    termsAcceptedAt: Date, termsVersion: String,
     alternatePhone: { type: String, default: '' },
     workerSettlement: { type: new mongoose.Schema({
       grossPaise: Number, commissionPaise: Number, earningsPaise: Number, cashHeldPaise: Number, settledAt: Date,
@@ -177,7 +190,8 @@ async function requireCustomer(req, res, next) {
     req.customer = {
       uid: decoded.uid,
       phoneNumber: decoded.phone_number || null,
-      email: decoded.email || null
+      email: decoded.email || null,
+      name: decoded.name || null
     };
     return next();
   } catch (_) {
@@ -188,8 +202,8 @@ async function requireCustomer(req, res, next) {
 }
 
 function customerLocalPhone(phoneNumber) {
-  const digits = String(phoneNumber || '').replace(/\D/g, '');
-  return digits.length >= 10 ? digits.slice(-10) : '';
+  const match = String(phoneNumber || '').match(/^\+91([6-9]\d{9})$/);
+  return match ? match[1] : '';
 }
 
 
@@ -201,7 +215,7 @@ app.get('/api/customer/me', requireCustomer, async (req, res) => {
 
     const customer = await Customer.findOneAndUpdate(
       { firebaseUid: req.customer.uid },
-      { $set: updates, $setOnInsert: { firebaseUid: req.customer.uid } },
+      { $set: updates, $setOnInsert: { firebaseUid: req.customer.uid, name: String(req.customer.name || '').slice(0, 80) } },
       { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
     ).lean();
 
@@ -393,18 +407,36 @@ app.post('/api/bookings', requireCustomer, async (req, res) => {
 
     const alternatePhone = String(req.body.alternatePhone || '').trim();
     if (alternatePhone && !/^\d{10}$/.test(alternatePhone)) return res.status(400).json({ message: 'Enter a valid alternate phone.' });
+    const { validPin, imagesValid, POLICY_VERSION, SERVICES } = require('./service-operations');
+    if (!SERVICES.includes(service)) return res.status(400).json({ message: 'Choose a supported service.' });
+    const newPolicyAccepted = req.body.termsVersion === POLICY_VERSION;
+    if (!newPolicyAccepted && (req.body.clientFeatureVersion >= 4 || req.body.location || req.body.problemPhotos?.length)) return res.status(400).json({ message: 'Update HomeFix and accept the current Terms and Privacy Policy.' });
+    const location = req.body.location;
+    if (location && !validPin(location)) return res.status(400).json({ message: 'Choose a valid location pin.' });
+    const scheduledAt = req.body.scheduledAt ? new Date(req.body.scheduledAt) : null;
+    if (scheduledAt && (!Number.isFinite(scheduledAt.getTime()) || scheduledAt <= new Date() || scheduledAt > new Date(Date.now()+90*86400000))) return res.status(400).json({ message: 'Choose a future service time within 90 days.' });
+    const ist = scheduledAt ? new Date(scheduledAt.getTime() + 330*60000) : null;
+    const canonicalDate = ist ? ist.toISOString().slice(0,10) : date;
+    const canonicalTime = ist ? `${String(ist.getUTCHours()).padStart(2,'0')}:${String(ist.getUTCMinutes()).padStart(2,'0')} IST` : time;
+    const photos = req.body.problemPhotos;
+    if (photos && photos.length && !imagesValid(photos)) return res.status(400).json({ message: 'Choose up to three JPEG/PNG problem photos, each under 400 KB.' });
+    const bookingId = new mongoose.Types.ObjectId();
     const booking = await Booking.create({
+      _id: bookingId, location: location ? { latitude: location.latitude, longitude: location.longitude, accuracy: Number(location.accuracy) || null, capturedAt: new Date() } : undefined,
+      scheduledAt, dispatchMode: newPolicyAccepted ? 'first_claim' : 'admin_assign', termsVersion: newPolicyAccepted ? POLICY_VERSION : 'legacy-not-recorded', termsAcceptedAt: newPolicyAccepted ? new Date() : null,
+      ...(photos?.length ? { problemPhotosEncrypted: require('./business-tools').encryptPrivate(photos, `booking:${bookingId}:problem`) } : {}),
       alternatePhone,
       customerUid: req.customer.uid,
       customerName,
       phone: String(phone),
       address,
       service,
-      date,
-      time,
+      date: canonicalDate,
+      time: canonicalTime,
       problem: problem || '',
     });
 
+    if (app.locals.notifyBooking) await app.locals.notifyBooking(booking).catch(() => {});
     return res.status(201).json({
       message: 'Booking saved successfully!',
       bookingId: booking._id,
@@ -451,6 +483,8 @@ app.post('/api/bookings/:id/payment/cash', requireCustomer, async (req, res) => 
     }
 
     booking.cashCollection = null;
+    booking.quoteAcceptedAt = new Date();
+    booking.acceptedQuotePaise = booking.quotedAmountPaise;
     booking.paymentMethod = 'cash_on_service';
     booking.paymentStatus = 'pending_collection';
     booking.razorpayOrderId = null;
@@ -610,6 +644,8 @@ app.post('/api/payments/razorpay/verify', requireCustomer, async (req, res) => {
       });
     }
 
+    booking.quoteAcceptedAt = booking.quoteAcceptedAt || new Date();
+    booking.acceptedQuotePaise = booking.quotedAmountPaise;
     booking.paymentStatus = 'paid';
     booking.razorpayPaymentId = paymentId;
     booking.paymentUpdatedAt = new Date();
@@ -844,12 +880,14 @@ app.patch('/api/admin/bookings/:id/quote', requireAdminKey, async (req, res) => 
     if (!booking) {
       return res.status(404).json({ message: 'Booking not found.' });
     }
-    if (booking.status === 'cancelled' || booking.paymentStatus === 'paid') {
+    if (booking.status === 'cancelled' || booking.status === 'completed' || booking.workStartedAt || booking.paymentStatus === 'paid') {
       return res.status(409).json({
         message: 'Cannot change the quote for a cancelled or paid booking.'
       });
     }
 
+    booking.quoteAcceptedAt = null;
+    booking.acceptedQuotePaise = null;
     booking.cashCollection = null;
     booking.quotedAmountPaise = Math.round(amount * 100);
     booking.paymentMethod = null;
@@ -912,12 +950,14 @@ app.post('/api/admin/bookings/:id/payment/cash/collect', requireAdminKey, async 
 
 app.get('/api/admin/bookings', requireAdminKey, async (req, res) => {
   try {
+    const page = Math.max(1, Math.min(10000, Number.parseInt(req.query.page, 10) || 1));
     const bookings = await Booking.find()
       .sort({ createdAt: -1 })
-      .limit(200)
+      .skip((page - 1) * 100)
+      .limit(101)
       .lean();
 
-    return res.json({ bookings });
+    return res.json({ bookings: bookings.slice(0, 100), hasMore: bookings.length > 100, page });
   } catch (error) {
     console.error('Admin bookings error:', error.message);
     return res.status(500).json({ message: 'Unable to load bookings.' });
@@ -938,13 +978,13 @@ app.patch('/api/admin/bookings/:id/status', requireAdminKey, async (req, res) =>
     }
 
     const booking = await Booking.findOneAndUpdate(
-      { _id: req.params.id, 'workerSettlement.settledAt': null },
+      { _id: req.params.id, 'workerSettlement.settledAt': null, ...(status !== 'completed' ? { status: { $ne: 'completed' } } : {}), ...(status === 'completed' ? { completionVerifiedAt: { $ne: null } } : {}) },
       { $set: { status, completedAt: status === 'completed' ? new Date() : null } },
       { new: true, runValidators: true }
     );
 
     if (!booking) {
-      return res.status(404).json({ message: 'Booking not found or earnings already settled.' });
+      return res.status(404).json({ message: 'Order not found, earnings settled, or a customer completion code is required.' });
     }
 
     return res.json({
@@ -961,7 +1001,7 @@ app.patch('/api/admin/bookings/:id/status', requireAdminKey, async (req, res) =>
 });
 
 require('./team-history').registerTeamHistory({
-  app, mongoose, Booking, Customer, requireAdminKey, requireCustomer, customerLocalPhone,
+  app, mongoose, Booking, Customer, customerFirebaseAuth, requireAdminKey, requireCustomer, customerLocalPhone,
 });
 
 app.get('/admin', (req, res) => {

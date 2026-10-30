@@ -85,7 +85,7 @@ function registerBusinessTools({ app, mongoose, Booking, Worker, Customer, requi
     let privateStorageReady = false;
     try { dataKey(); privateStorageReady = true; } catch (_) {}
     res.json({ privateStorageReady, supportPhone: settings?.supportPhone || '9863902010', commissionPercent: settings?.commissionPercent ?? 20,
-      featureVersion: 3, identityReview: 'manual', withdrawals: 'manual_admin_payment' });
+      featureVersion: 4, completionCodes: 'customer_app', dispatchModes: ['first_claim','admin_assign'], policyVersion: '2026-10-30-v4', identityReview: 'manual', withdrawals: 'manual_admin_payment' });
   }));
   app.patch('/api/admin/settings', requireAdminKey, wrap(async (req, res) => {
     const phone = req.body?.supportPhone;
